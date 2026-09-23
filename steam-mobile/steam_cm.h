@@ -129,6 +129,8 @@ typedef struct {
 	gchar *message;            /* plain text (bbcode stripped when Steam provides it), may be NULL for typing */
 	guint32 timestamp;         /* unix time from the server */
 	gboolean local_echo;       /* sent by us from another client; from_steamid is the peer */
+	gchar *message_bbcode;     /* the message with Steam's BBCode ([emoticon], [img], [url], ...), NULL if absent */
+	guint32 ordinal;           /* tells apart messages with the same timestamp */
 } SteamCMMessage;
 
 typedef struct {
@@ -243,6 +245,20 @@ typedef void (*SteamCMHistoryFunc)(SteamCM *cm, guint64 friend_steamid,
 void steam_cm_get_recent_messages(SteamCM *cm, guint64 friend_steamid,
                                   guint32 since, guint count,
                                   SteamCMHistoryFunc callback, gpointer user_data);
+
+/* The same with every request field. Messages come newest first. */
+typedef struct {
+	guint count;                     /* count: at most this many */
+	gboolean most_recent_conversation;
+	guint32 start_time;              /* rtime32_start_time: nothing older (0 = no bound) */
+	guint32 start_ordinal;           /* start_ordinal, with start_time */
+	guint32 time_last;               /* time_last: nothing newer (0 = not sent) */
+	guint32 ordinal_last;            /* ordinal_last, with time_last (0 = not sent) */
+	gboolean bbcode;                 /* bbcode_format: messages keep Steam's BBCode */
+} SteamCMHistoryQuery;
+void steam_cm_get_recent_messages_query(SteamCM *cm, guint64 friend_steamid,
+                                        const SteamCMHistoryQuery *query,
+                                        SteamCMHistoryFunc callback, gpointer user_data);
 
 /* FriendMessages.GetActiveMessageSessions: which friends have unread or
  * recent messages, used to fetch offline history after logon. */

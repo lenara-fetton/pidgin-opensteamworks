@@ -257,6 +257,26 @@ Dropped features (no longer feasible without a web session): user search
 by name, "redeem game key" action, captcha. The "view profile" menu item
 stays (it's just a URL).
 
+## Message-meta UIs (pidgin4)
+
+A UI that renders message metadata itself says so with
+`purple_core_get_ui_info()["message-meta"] == "1"` (pidgin4 does; stock
+Pidgin doesn't). `steam_native_init()` reads it at login into
+`SteamAccount.native_meta`, and every behaviour below checks it. Without it
+nothing new runs, and the output is exactly what it was.
+
+- **Inline images and emoticons.** Live messages are rendered from the
+  BBCode form (`message`, field 4 of `IncomingMessage`), and history is
+  fetched with `bbcode_format`. `steam_rich_to_html()` turns
+  `[emoticon]name[/emoticon]` (and `ːnameː`/`:name:` in plain text) into
+  `<img src="https://steamcommunity-a.akamaihd.net/economy/emoticon/name"
+  alt=":name:">`, and images on `images.steamusercontent.com` /
+  `steamusercontent-a.akamaihd.net` (`[img src=…]`, `[url=…]` or a bare
+  link) into the link, `<br/>` and an `<img>`. Stickers become the text
+  `[sticker: Name]` (their CDN path isn't verified); other tags are dropped
+  with their content kept. Messages sent from another client of ours get
+  the same treatment.
+
 ## Testing without a Steam account
 
 - `tests/test_proto.c`: round-trips for `steam_proto` and `steam_msgs`;

@@ -986,6 +986,8 @@ cm_handle_incoming_message(SteamCM *cm, const guint8 *body, gsize len)
 	msg.message = (m.message_no_bbcode && *m.message_no_bbcode) ? m.message_no_bbcode : m.message;
 	msg.timestamp = m.rtime32_server_timestamp;
 	msg.local_echo = m.local_echo;
+	msg.message_bbcode = m.message;
+	msg.ordinal = m.ordinal;
 
 	purple_debug_misc("steam", "CM: message type %d from %" G_GUINT64_FORMAT "%s\n",
 	                  msg.type, msg.from_steamid, msg.local_echo ? " (local echo)" : "");
@@ -1645,6 +1647,20 @@ void
 steam_cm_get_recent_messages(SteamCM *cm, guint64 friend_steamid, guint32 since,
                              guint count, SteamCMHistoryFunc callback, gpointer user_data)
 {
+	SteamCMHistoryQuery query;
+
+	memset(&query, 0, sizeof(query));
+	query.count = count;
+	query.most_recent_conversation = since == 0;
+	query.start_time = since;
+	steam_cm_get_recent_messages_query(cm, friend_steamid, &query, callback, user_data);
+}
+
+void
+steam_cm_get_recent_messages_query(SteamCM *cm, guint64 friend_steamid,
+                                   const SteamCMHistoryQuery *query,
+                                   SteamCMHistoryFunc callback, gpointer user_data)
+{
 	SteamMsgFriendMessagesGetRecentMessagesRequest m;
 	GByteArray *body;
 
@@ -1654,10 +1670,16 @@ steam_cm_get_recent_messages(SteamCM *cm, guint64 friend_steamid, guint32 since,
 	steam_msg_friend_messages_get_recent_messages_request_init(&m);
 	STEAM_MSG_SET(&m, steamid1, cm->session_steamid);
 	STEAM_MSG_SET(&m, steamid2, friend_steamid);
-	STEAM_MSG_SET(&m, count, count);
-	STEAM_MSG_SET(&m, most_recent_conversation, since == 0);
-	STEAM_MSG_SET(&m, rtime32_start_time, since);
-	STEAM_MSG_SET(&m, bbcode_format, FALSE);
+	STEAM_MSG_SET(&m, count, query->count);
+	STEAM_MSG_SET(&m, most_recent_conversation, query->most_recent_conversation);
+	STEAM_MSG_SET(&m, rtime32_start_time, query->start_time);
+	STEAM_MSG_SET(&m, bbcode_format, query->bbcode);
+	if (query->start_ordinal)
+		STEAM_MSG_SET(&m, start_ordinal, query->start_ordinal);
+	if (query->time_last)
+		STEAM_MSG_SET(&m, time_last, query->time_last);
+	if (query->ordinal_last)
+		STEAM_MSG_SET(&m, ordinal_last, query->ordinal_last);
 	body = g_byte_array_new();
 	steam_msg_friend_messages_get_recent_messages_request_encode(&m, body);
 	cm_call_service(cm, STEAM_METHOD_FRIEND_MESSAGES_GET_RECENT_MESSAGES, body,

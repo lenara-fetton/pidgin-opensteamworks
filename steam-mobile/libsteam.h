@@ -149,6 +149,12 @@ struct _SteamAccount {
 	GHashTable *app_names;         /* appid -> game name ("" while unknown) */
 	GSList *app_fetches;           /* SteamAppFetch in flight */
 	GSList *pending_sends;         /* SteamSendContext awaiting a SendMessage reply */
+
+	/* The UI renders message metadata itself (ui_info "message-meta" =
+	 * "1", pidgin4). Every behaviour that such a UI gets on top of the
+	 * stock one checks this; on stock Pidgin it is FALSE and the output
+	 * is unchanged. */
+	gboolean native_meta;
 };
 
 struct _SteamBuddy {

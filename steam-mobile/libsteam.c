@@ -410,6 +410,479 @@ steam_text_to_html(const gchar *text)
 	return html;
 }
 
+/******************************************************************************/
+/* Rich text for message-meta UIs (native_meta only)                          */
+/******************************************************************************/
+
+/*
+ * Steam messages carry BBCode: [emoticon]name[/emoticon],
+ * [img src=URL ...][/img] for shared images, [url=URL]text[/url],
+ * [sticker type="Name" ...][/sticker], plus formatting tags ([quote],
+ * [spoiler], [code], ...), and \[ for a literal bracket. Without BBCode
+ * (message_no_bbcode, or history fetched without bbcode_format) emoticons
+ * are written "ːnameː" with U+02D0, and people also type ":name:".
+ *
+ * steam_rich_to_html() turns either form into libpurple markup:
+ *   - emoticons become <img src="<CDN>/economy/emoticon/NAME" alt=":NAME:">
+ *     (the text token stays as alt text);
+ *   - images on Steam's user-content hosts become the link, a line break
+ *     and an explicit <img> (the UI previews a bare single-URL body by
+ *     itself, but images often come with text);
+ *   - other links become <a href>;
+ *   - stickers become the text "[sticker: Name]" (no verified CDN URL);
+ *   - other tags are dropped, their content kept.
+ * Anything malformed stays literal text. The UI's image loader decides
+ * which hosts it fetches from.
+ */
+
+/* Serves emoticons directly; community.cloudflare.steamstatic.com answers
+ * the same path with a redirect to community.steamstatic.com. */
+#define STEAM_EMOTICON_URL "https://steamcommunity-a.akamaihd.net/economy/emoticon/"
+#define STEAM_EMOTICON_NAME_MAX 64
+
+/* Hosts of images shared in chat (user content) */
+static const gchar *const steam_image_hosts[] = {
+	"images.steamusercontent.com",
+	"steamusercontent-a.akamaihd.net",
+};
+
+static gboolean
+steam_rich_name_char(gchar c)
+{
+	return g_ascii_isalnum(c) || c == '_';
+}
+
+/* The host of an http(s) URL (lower-case, caller frees), or NULL */
+static gchar *
+steam_rich_url_host(const gchar *url, gboolean *https)
+{
+	const gchar *p, *end;
+
+	if (g_ascii_strncasecmp(url, "https://", 8) == 0) {
+		p = url + 8;
+		*https = TRUE;
+	} else if (g_ascii_strncasecmp(url, "http://", 7) == 0) {
+		p = url + 7;
+		*https = FALSE;
+	} else {
+		return NULL;
+	}
+
+	for (end = p; *end && *end != '/' && *end != '?' && *end != '#'; end++) {
+		// "https://images.steamusercontent.com@evil.example/" and ports
+		if (*end == '@' || *end == ':')
+			return NULL;
+	}
+	if (end == p)
+		return NULL;
+
+	return g_ascii_strdown(p, end - p);
+}
+
+/* Is `url` an https image on one of Steam's user-content hosts? */
+static gboolean
+steam_rich_is_image_url(const gchar *url)
+{
+	gboolean https = FALSE;
+	gchar *host = steam_rich_url_host(url, &https);
+	gboolean ret = FALSE;
+	guint i;
+
+	if (host != NULL && https) {
+		for (i = 0; i < G_N_ELEMENTS(steam_image_hosts); i++) {
+			if (g_str_equal(host, steam_image_hosts[i]))
+				ret = TRUE;
+		}
+	}
+	g_free(host);
+	return ret;
+}
+
+static void
+steam_rich_append_escaped(GString *out, const gchar *text, gssize len)
+{
+	gchar *escaped = g_markup_escape_text(text, len);
+
+	g_string_append(out, escaped);
+	g_free(escaped);
+}
+
+static void
+steam_rich_append_emoticon(GString *out, const gchar *name, gsize len)
+{
+	gchar *n = g_strndup(name, len);
+
+	g_string_append_printf(out, "<img src=\"" STEAM_EMOTICON_URL "%s\" alt=\":%s:\">", n, n);
+	g_free(n);
+}
+
+/* <a href="url">text</a>, then <br/><img src="url"> for images. `text` is
+ * markup; NULL shows the URL. */
+static void
+steam_rich_append_link(GString *out, const gchar *url, const gchar *text_markup)
+{
+	gchar *href = g_markup_escape_text(url, -1);
+
+	g_string_append_printf(out, "<a href=\"%s\">%s</a>", href, text_markup ? text_markup : href);
+	if (steam_rich_is_image_url(url))
+		g_string_append_printf(out, "<br/><img src=\"%s\">", href);
+	g_free(href);
+}
+
+/* Length of an emoticon token at `p` (":name:" or "ːnameː"), 0 if none.
+ * `*name`/`*name_len` get the name. `start` is the whole text, to look
+ * at the character before a ':' token. */
+static gsize
+steam_rich_emoticon_token(const gchar *start, const gchar *p, const gchar *end,
+		const gchar **name, gsize *name_len)
+{
+	const gchar *q;
+	gsize delim;
+	gboolean letter = FALSE;
+
+	if (end - p >= 2 && (guchar) p[0] == 0xcb && (guchar) p[1] == 0x90) {
+		delim = 2;                    // U+02D0 MODIFIER LETTER TRIANGULAR COLON
+	} else if (*p == ':') {
+		// Not inside a word, a number or a time ("abc:def:", "10:30:45")
+		if (p > start && (steam_rich_name_char(p[-1]) || p[-1] == ':'))
+			return 0;
+		delim = 1;
+	} else {
+		return 0;
+	}
+
+	for (q = p + delim; q < end && steam_rich_name_char(*q); q++) {
+		if (g_ascii_isalpha(*q))
+			letter = TRUE;
+	}
+	if (q == p + delim || q - (p + delim) > STEAM_EMOTICON_NAME_MAX || !letter)
+		return 0;
+	if ((gsize) (end - q) < delim || memcmp(q, p, delim) != 0)
+		return 0;
+	if (delim == 1 && q - (p + delim) < 2)
+		return 0;                     // ":P:" and friends are too likely to be text
+
+	*name = p + delim;
+	*name_len = q - (p + delim);
+	return (q + delim) - p;
+}
+
+/* Length of a bare URL at `p`, 0 if none */
+static gsize
+steam_rich_url_token(const gchar *start, const gchar *p, const gchar *end)
+{
+	const gchar *q;
+
+	if (p > start && !g_ascii_isspace(p[-1]) && p[-1] != '(')
+		return 0;
+	if (!((end - p > 8 && g_ascii_strncasecmp(p, "https://", 8) == 0) ||
+	      (end - p > 7 && g_ascii_strncasecmp(p, "http://", 7) == 0)))
+		return 0;
+
+	for (q = p; q < end && !g_ascii_isspace(*q) && *q != '<' && *q != '>' &&
+	            *q != '"' && *q != '[' && *q != ']'; q++);
+	// Trailing punctuation belongs to the sentence
+	while (q > p && strchr(".,;:!?)'", q[-1]) != NULL)
+		q--;
+	return q - p;
+}
+
+/* Plain text (no BBCode): escaped, newlines as <br>, emoticon tokens and
+ * (with `links`) bare image URLs converted. */
+static void
+steam_rich_append_text(GString *out, const gchar *text, gsize len, gboolean links)
+{
+	const gchar *p = text, *end = text + len, *run = text;
+
+	while (p < end) {
+		const gchar *name = NULL;
+		gsize name_len = 0, n;
+
+		if ((n = steam_rich_emoticon_token(text, p, end, &name, &name_len)) > 0) {
+			steam_rich_append_escaped(out, run, p - run);
+			steam_rich_append_emoticon(out, name, name_len);
+			p += n;
+			run = p;
+		} else if (links && (n = steam_rich_url_token(text, p, end)) > 0) {
+			gchar *url = g_strndup(p, n);
+
+			steam_rich_append_escaped(out, run, p - run);
+			if (steam_rich_is_image_url(url))
+				steam_rich_append_link(out, url, NULL);
+			else
+				steam_rich_append_escaped(out, url, -1);   // the UI linkifies it
+			g_free(url);
+			p += n;
+			run = p;
+		} else if (*p == '\n') {
+			steam_rich_append_escaped(out, run, p - run);
+			g_string_append(out, "<br>");
+			p++;
+			run = p;
+		} else if (*p == '\r') {
+			steam_rich_append_escaped(out, run, p - run);
+			p++;
+			run = p;
+		} else {
+			p++;
+		}
+	}
+	steam_rich_append_escaped(out, run, p - run);
+}
+
+typedef struct {
+	gboolean closing;
+	gchar *name;           /* lower case */
+	GHashTable *attrs;     /* name -> value; the tag's own "=value" is under its name */
+	gsize len;             /* of the whole "[...]" */
+} SteamBBTag;
+
+static void
+steam_bbtag_clear(SteamBBTag *tag)
+{
+	g_free(tag->name);
+	if (tag->attrs)
+		g_hash_table_destroy(tag->attrs);
+	memset(tag, 0, sizeof(*tag));
+}
+
+/* Parses "[name attr=value attr="value"]" or "[/name]" at `p` */
+static gboolean
+steam_bbtag_parse(const gchar *p, const gchar *end, SteamBBTag *tag)
+{
+	const gchar *q = p + 1, *name;
+
+	memset(tag, 0, sizeof(*tag));
+	if (q < end && *q == '/') {
+		tag->closing = TRUE;
+		q++;
+	}
+	for (name = q; q < end && (g_ascii_isalnum(*q) || *q == '_'); q++);
+	if (q == name)
+		return FALSE;
+	tag->name = g_ascii_strdown(name, q - name);
+	tag->attrs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+
+	while (q < end && *q != ']') {
+		const gchar *key, *key_end, *val, *val_end;
+
+		if (*q == '=') {
+			key = tag->name;
+			key_end = tag->name + strlen(tag->name);
+		} else {
+			while (q < end && *q == ' ')
+				q++;
+			for (key = q; q < end && (g_ascii_isalnum(*q) || *q == '_' || *q == '-'); q++);
+			key_end = q;
+			if (key == key_end) {
+				if (q < end && *q == ']')
+					break;
+				steam_bbtag_clear(tag);
+				return FALSE;
+			}
+			if (q >= end || *q != '=') {
+				g_hash_table_replace(tag->attrs, g_ascii_strdown(key, key_end - key), g_strdup(""));
+				continue;
+			}
+		}
+		q++;   // '='
+		if (q < end && *q == '"') {
+			for (val = ++q; q < end && *q != '"'; q++);
+			if (q >= end) {
+				steam_bbtag_clear(tag);
+				return FALSE;
+			}
+			val_end = q++;
+		} else {
+			for (val = q; q < end && *q != ' ' && *q != ']'; q++);
+			val_end = q;
+		}
+		g_hash_table_replace(tag->attrs, g_ascii_strdown(key, key_end - key), g_strndup(val, val_end - val));
+	}
+	if (q >= end) {
+		steam_bbtag_clear(tag);
+		return FALSE;
+	}
+	tag->len = q + 1 - p;
+	return TRUE;
+}
+
+/* Finds "[/name]" from `p`; returns its start or NULL */
+static const gchar *
+steam_bbtag_find_close(const gchar *p, const gchar *end, const gchar *name)
+{
+	gchar *needle = g_strdup_printf("[/%s]", name);
+	gsize n = strlen(needle);
+	const gchar *q, *ret = NULL;
+
+	for (q = p; q + n <= end; q++) {
+		if (g_ascii_strncasecmp(q, needle, n) == 0) {
+			ret = q;
+			break;
+		}
+	}
+	g_free(needle);
+	return ret;
+}
+
+/* Text with Steam's BBCode unescaped ("\[" -> "["), for tag contents */
+static gchar *
+steam_bbcode_unescape(const gchar *text, gsize len)
+{
+	GString *s = g_string_sized_new(len);
+	gsize i;
+
+	for (i = 0; i < len; i++) {
+		if (text[i] == '\\' && i + 1 < len && text[i + 1] == '[')
+			i++;
+		g_string_append_c(s, text[i]);
+	}
+	return g_string_free(s, FALSE);
+}
+
+static void
+steam_rich_append_bbcode(GString *out, const gchar *text, gsize len)
+{
+	const gchar *p = text, *end = text + len, *run = text;
+
+	while (p < end) {
+		SteamBBTag tag;
+		const gchar *close, *content;
+		gchar *inner, *url;
+
+		if (*p == '\\' && p + 1 < end && p[1] == '[') {
+			// An escaped bracket: literal "["
+			steam_rich_append_text(out, run, p - run, TRUE);
+			g_string_append_c(out, '[');
+			p += 2;
+			run = p;
+			continue;
+		}
+		if (*p != '[' || !steam_bbtag_parse(p, end, &tag)) {
+			p++;
+			continue;
+		}
+
+		steam_rich_append_text(out, run, p - run, TRUE);
+		content = p + tag.len;
+		close = tag.closing ? NULL : steam_bbtag_find_close(content, end, tag.name);
+
+		if (!tag.closing && close != NULL && g_str_equal(tag.name, "emoticon")) {
+			const gchar *name = NULL;
+			gsize name_len = 0;
+			gchar *token = g_strdup_printf(":%.*s:", (int) (close - content), content);
+
+			if (steam_rich_emoticon_token(token, token, token + strlen(token), &name, &name_len) == strlen(token))
+				steam_rich_append_emoticon(out, name, name_len);
+			else
+				steam_rich_append_text(out, content, close - content, FALSE);
+			g_free(token);
+			p = close + strlen("[/emoticon]");
+		} else if (!tag.closing && close != NULL && g_str_equal(tag.name, "img")) {
+			url = g_strdup(g_hash_table_lookup(tag.attrs, "src"));
+			if (url == NULL || *url == '\0') {
+				g_free(url);
+				url = steam_bbcode_unescape(content, close - content);
+			}
+			url = g_strstrip(url);
+			if (steam_rich_url_token(url, url, url + strlen(url)) == strlen(url))
+				steam_rich_append_link(out, url, NULL);
+			else
+				steam_rich_append_text(out, url, strlen(url), FALSE);
+			g_free(url);
+			p = close + strlen("[/img]");
+		} else if (!tag.closing && close != NULL && g_str_equal(tag.name, "url")) {
+			const gchar *href = g_hash_table_lookup(tag.attrs, "url");
+
+			inner = steam_bbcode_unescape(content, close - content);
+			url = g_strstrip(g_strdup(href && *href ? href : inner));
+			if (steam_rich_url_token(url, url, url + strlen(url)) == strlen(url)) {
+				GString *text_markup = NULL;
+
+				if (href && *href && *inner) {
+					text_markup = g_string_new(NULL);
+					steam_rich_append_text(text_markup, inner, strlen(inner), FALSE);
+				}
+				steam_rich_append_link(out, url, text_markup ? text_markup->str : NULL);
+				if (text_markup)
+					g_string_free(text_markup, TRUE);
+			} else {
+				steam_rich_append_text(out, inner, strlen(inner), TRUE);
+			}
+			g_free(url);
+			g_free(inner);
+			p = close + strlen("[/url]");
+		} else if (!tag.closing && g_str_equal(tag.name, "sticker")) {
+			const gchar *type = g_hash_table_lookup(tag.attrs, "type");
+			gchar *line = g_strdup_printf("[sticker: %s]", type && *type ? type : "?");
+
+			steam_rich_append_escaped(out, line, -1);
+			g_free(line);
+			p = close ? close + strlen("[/sticker]") : content;
+		} else {
+			// Formatting and other tags: drop the tag, keep what's inside
+			p = content;
+		}
+		run = p;
+		steam_bbtag_clear(&tag);
+	}
+	steam_rich_append_text(out, run, p - run, TRUE);
+}
+
+/* Libpurple markup for a message (see above). `bbcode` says whether `text`
+ * is in Steam's BBCode form. `fallback` (plain, may be NULL) is used when
+ * the BBCode leaves nothing to show, e.g. only a [gameinvite]. */
+static gchar *
+steam_rich_to_html(const gchar *text, gboolean bbcode, const gchar *fallback)
+{
+	gchar *salvaged = purple_utf8_salvage(text ? text : "");
+	GString *out = g_string_new(NULL);
+
+	if (bbcode)
+		steam_rich_append_bbcode(out, salvaged, strlen(salvaged));
+	else
+		steam_rich_append_text(out, salvaged, strlen(salvaged), TRUE);
+	g_free(salvaged);
+
+	if (bbcode && fallback != NULL && *fallback) {
+		gchar *plain = purple_markup_strip_html(out->str);
+
+		g_strstrip(plain);
+		if (*plain == '\0' && strstr(out->str, "<img") == NULL) {
+			g_free(plain);
+			g_string_free(out, TRUE);
+			return steam_rich_to_html(fallback, FALSE, NULL);
+		}
+		g_free(plain);
+	}
+
+	return g_string_free(out, FALSE);
+}
+
+/* How a message is shown: rich for message-meta UIs, as before otherwise.
+ * `bbcode_text` is the BBCode form (may be NULL), `plain` the text without
+ * BBCode that stock Pidgin shows. */
+static gchar *
+steam_message_to_html(SteamAccount *sa, const gchar *bbcode_text, const gchar *plain)
+{
+	if (!sa->native_meta)
+		return steam_text_to_html(plain);
+	if (bbcode_text != NULL && *bbcode_text)
+		return steam_rich_to_html(bbcode_text, TRUE, plain);
+	return steam_rich_to_html(plain, FALSE, NULL);
+}
+
+static void
+steam_native_init(SteamAccount *sa)
+{
+	GHashTable *ui_info = purple_core_get_ui_info();
+
+	sa->native_meta = ui_info != NULL &&
+		purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1");
+	if (sa->native_meta)
+		purple_debug_info("steam", "UI supports message-meta: inline images and emoticons\n");
+}
+
 /* Remembers the first live message shown for `who` since the last logon,
  * so offline history fetched afterwards does not show it (or anything newer)
  * a second time. */
@@ -930,7 +1403,9 @@ steam_got_history_cb(SteamCM *cm, guint64 friend_steamid,
 		if (live_since && message->timestamp >= live_since)
 			continue;
 
-		html = steam_text_to_html(message->message);
+		// Fetched with bbcode_format for message-meta UIs
+		html = sa->native_meta ? steam_rich_to_html(message->message, TRUE, NULL)
+		                       : steam_text_to_html(message->message);
 		if (message->accountid == own_accountid) {
 			steam_write_sent_message(sa, who, html, PURPLE_MESSAGE_DELAYED, message->timestamp);
 		} else {
@@ -957,8 +1432,22 @@ steam_got_message_sessions_cb(SteamCM *cm, const SteamCMMessageSession *sessions
 
 		if (session->last_message > sa->history_since)
 		{
-			steam_cm_get_recent_messages(cm, steam_cm_accountid_to_steamid(session->accountid_friend),
-					sa->history_since, STEAM_HISTORY_COUNT, steam_got_history_cb, sa);
+			guint64 friend_steamid = steam_cm_accountid_to_steamid(session->accountid_friend);
+
+			if (sa->native_meta) {
+				// The same request, with BBCode for inline images and emoticons
+				SteamCMHistoryQuery query;
+
+				memset(&query, 0, sizeof(query));
+				query.count = STEAM_HISTORY_COUNT;
+				query.most_recent_conversation = sa->history_since == 0;
+				query.start_time = sa->history_since;
+				query.bbcode = TRUE;
+				steam_cm_get_recent_messages_query(cm, friend_steamid, &query, steam_got_history_cb, sa);
+			} else {
+				steam_cm_get_recent_messages(cm, friend_steamid,
+						sa->history_since, STEAM_HISTORY_COUNT, steam_got_history_cb, sa);
+			}
 		}
 	}
 }
@@ -1429,7 +1918,7 @@ steam_cm_message_cb(SteamCM *cm, const SteamCMMessage *message, gpointer user_da
 					break;
 			}
 
-			html = steam_text_to_html(message->message);
+			html = steam_message_to_html(sa, message->message_bbcode, message->message);
 			if (message->local_echo) {
 				steam_write_sent_message(sa, who, html, 0, timestamp);
 			} else {
@@ -2003,6 +2492,7 @@ steam_login(PurpleAccount *account)
 
 	sa->last_message_timestamp = (guint32) purple_account_get_int(account, "last_message_timestamp", 0);
 	sa->steamid = g_ascii_strtoull(purple_account_get_string(account, "steamid", "0"), NULL, 10);
+	steam_native_init(sa);
 
 	if (!purple_ssl_is_supported()) {
 		purple_connection_error (pc,
