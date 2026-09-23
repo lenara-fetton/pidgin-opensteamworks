@@ -40,6 +40,24 @@ int main(int argc, char **argv)
 	l = prpl->status_types(NULL);
 	printf("status types: %d\n", g_list_length(l));
 	if (g_list_length(l) < 5) fails++;
+	{
+		/* Rich presence: the independent "ingame" status carries the game's
+		 * name and Steam app id */
+		GList *t;
+		PurpleStatusType *ingame = NULL;
+
+		for (t = l; t; t = t->next)
+			if (purple_strequal(purple_status_type_get_id(t->data), "ingame"))
+				ingame = t->data;
+		if (!ingame || purple_status_type_is_exclusive(ingame) ||
+		    !purple_status_type_get_attr(ingame, "game") ||
+		    !purple_status_type_get_attr(ingame, "game_app_id")) {
+			printf("FAIL: no ingame status type with game and game_app_id attributes\n");
+			fails++;
+		} else {
+			printf("ingame attributes: game, game_app_id\n");
+		}
+	}
 	for (l = prpl->protocol_options; l; l = l->next)
 		printf("option: %s\n", purple_account_option_get_setting(l->data));
 

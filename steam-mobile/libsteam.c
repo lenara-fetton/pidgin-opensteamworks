@@ -1243,7 +1243,16 @@ steam_buddy_update_status(SteamAccount *sa, SteamBuddy *sbuddy)
 	}
 
 	if (sbuddy->gameextrainfo && *(sbuddy->gameextrainfo)) {
-		purple_prpl_got_user_status(sa->account, steamid, "ingame", "game", sbuddy->gameextrainfo, NULL);
+		/* Rich presence for UIs that show it (pidgin4): "game" is the name,
+		 * "game_app_id" the Steam app id (unset for non-Steam games) */
+		gchar *app_id = sbuddy->game_app_id ? g_strdup_printf("%u", sbuddy->game_app_id) : NULL;
+
+		if (app_id)
+			purple_prpl_got_user_status(sa->account, steamid, "ingame", "game", sbuddy->gameextrainfo,
+			                            "game_app_id", app_id, NULL);
+		else
+			purple_prpl_got_user_status(sa->account, steamid, "ingame", "game", sbuddy->gameextrainfo, NULL);
+		g_free(app_id);
 	} else {
 		purple_prpl_got_user_status_deactive(sa->account, steamid, "ingame");
 	}
@@ -2276,10 +2285,14 @@ steam_status_types(PurpleAccount *account)
 		}
 	}
 
-	// Independent, unsettable status for being in-game
+	// Independent, unsettable status for being in-game.
+	// "game" is the game's name, "game_app_id" its Steam app id (a decimal
+	// string; unset for non-Steam games). UIs that don't know the attributes
+	// ignore them.
 	status = purple_status_type_new_with_attrs(PURPLE_STATUS_TUNE,
 			"ingame", NULL, FALSE, FALSE, TRUE,
 			"game", "Game Title", purple_value_new(PURPLE_TYPE_STRING),
+			"game_app_id", "Game App ID", purple_value_new(PURPLE_TYPE_STRING),
 			NULL);
 	types = g_list_append(types, status);
 
