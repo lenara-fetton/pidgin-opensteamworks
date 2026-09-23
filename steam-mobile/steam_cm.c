@@ -998,6 +998,25 @@ cm_handle_incoming_message(SteamCM *cm, const guint8 *body, gsize len)
 }
 
 static void
+cm_handle_ack_echo(SteamCM *cm, const guint8 *body, gsize len)
+{
+	SteamMsgFriendMessagesAckMessage m;
+
+	steam_msg_friend_messages_ack_message_init(&m);
+	if (!steam_msg_friend_messages_ack_message_decode(&m, body, len) ||
+	    !m.has_steamid_partner || !m.has_timestamp) {
+		purple_debug_warning("steam", "CM: malformed NotifyAckMessageEcho\n");
+		steam_msg_friend_messages_ack_message_clear(&m);
+		return;
+	}
+	purple_debug_misc("steam", "CM: read up to %u with %" G_GUINT64_FORMAT " on another session\n",
+	                  m.timestamp, m.steamid_partner);
+	if (CM_ALIVE(cm) && cm->cb.ack_echo)
+		cm->cb.ack_echo(cm, m.steamid_partner, m.timestamp, cm->user_data);
+	steam_msg_friend_messages_ack_message_clear(&m);
+}
+
+static void
 cm_handle_service_method(SteamCM *cm, const SteamMsgProtoBufHeader *hdr,
                          const guint8 *body, gsize len)
 {
@@ -1005,6 +1024,8 @@ cm_handle_service_method(SteamCM *cm, const SteamMsgProtoBufHeader *hdr,
 
 	if (name != NULL && strcmp(name, STEAM_NOTIFY_FRIEND_MESSAGES_INCOMING_MESSAGE) == 0)
 		cm_handle_incoming_message(cm, body, len);
+	else if (name != NULL && strcmp(name, STEAM_NOTIFY_FRIEND_MESSAGES_ACK_ECHO) == 0)
+		cm_handle_ack_echo(cm, body, len);
 	else
 		purple_debug_misc("steam", "CM: ignoring notification %s\n", name ? name : "(unnamed)");
 }
@@ -1585,10 +1606,53 @@ cm_send_message_done(SteamCM *cm, CMJob *job, SteamEResult eresult,
 		callback(cm, eresult, server_timestamp, job->user_data);
 }
 
+static void
+cm_send_message_full_done(SteamCM *cm, CMJob *job, SteamEResult eresult,
+                          const guint8 *body, gsize len)
+{
+	SteamCMSendMessageFullFunc callback = (SteamCMSendMessageFullFunc) job->callback;
+	guint32 server_timestamp = 0, ordinal = 0;
+
+	if (body != NULL) {
+		SteamMsgFriendMessagesSendMessageResponse resp;
+
+		steam_msg_friend_messages_send_message_response_init(&resp);
+		steam_msg_friend_messages_send_message_response_decode(&resp, body, len);
+		server_timestamp = resp.server_timestamp;
+		ordinal = resp.ordinal;
+		steam_msg_friend_messages_send_message_response_clear(&resp);
+	}
+	if (callback)
+		callback(cm, eresult, server_timestamp, ordinal, job->user_data);
+}
+
+static void
+cm_send_message_internal(SteamCM *cm, guint64 steamid, SteamChatEntryType type,
+                         const gchar *message, CMJobHandler handler, gpointer callback,
+                         gpointer user_data);
+
 void
 steam_cm_send_message(SteamCM *cm, guint64 steamid, SteamChatEntryType type,
                       const gchar *message, SteamCMSendMessageFunc callback,
                       gpointer user_data)
+{
+	cm_send_message_internal(cm, steamid, type, message,
+	                         callback ? cm_send_message_done : NULL, (gpointer) callback, user_data);
+}
+
+void
+steam_cm_send_message_full(SteamCM *cm, guint64 steamid, SteamChatEntryType type,
+                           const gchar *message, SteamCMSendMessageFullFunc callback,
+                           gpointer user_data)
+{
+	cm_send_message_internal(cm, steamid, type, message,
+	                         callback ? cm_send_message_full_done : NULL, (gpointer) callback, user_data);
+}
+
+static void
+cm_send_message_internal(SteamCM *cm, guint64 steamid, SteamChatEntryType type,
+                         const gchar *message, CMJobHandler handler, gpointer callback,
+                         gpointer user_data)
 {
 	SteamMsgFriendMessagesSendMessageRequest m;
 	GByteArray *body;
@@ -1606,9 +1670,30 @@ steam_cm_send_message(SteamCM *cm, guint64 steamid, SteamChatEntryType type,
 	body = g_byte_array_new();
 	steam_msg_friend_messages_send_message_request_encode(&m, body);
 	cm_call_service(cm, STEAM_METHOD_FRIEND_MESSAGES_SEND_MESSAGE, body,
-	                callback ? cm_send_message_done : NULL, (gpointer) callback, user_data, steamid);
+	                handler, callback, user_data, steamid);
 	g_byte_array_unref(body);
 	steam_msg_friend_messages_send_message_request_clear(&m);
+}
+
+/* --- FriendMessages.AckMessage --- */
+
+void
+steam_cm_ack_message(SteamCM *cm, guint64 steamid_partner, guint32 timestamp)
+{
+	SteamMsgFriendMessagesAckMessage m;
+	GByteArray *body;
+
+	if (!cm_check_logged_on(cm, "ack_message"))
+		return;
+
+	steam_msg_friend_messages_ack_message_init(&m);
+	STEAM_MSG_SET(&m, steamid_partner, steamid_partner);
+	STEAM_MSG_SET(&m, timestamp, timestamp);
+	body = g_byte_array_new();
+	steam_msg_friend_messages_ack_message_encode(&m, body);
+	cm_call_service(cm, STEAM_METHOD_FRIEND_MESSAGES_ACK_MESSAGE, body, NULL, NULL, NULL, steamid_partner);
+	g_byte_array_unref(body);
+	steam_msg_friend_messages_ack_message_clear(&m);
 }
 
 /* --- FriendMessages.GetRecentMessages --- */

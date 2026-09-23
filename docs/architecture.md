@@ -209,7 +209,7 @@ on `jobid_target`. Notifications come as `ServiceMethod`.
   `FriendMessages.GetActiveMessageSessions#1`. The `notices` field is
   ignored.
 - `Player.GetNicknameList#1`: `Request {}` → `Response { repeated PlayerNickname nicknames = 1 { fixed32 accountid = 1; string nickname = 2; } }`. Note `accountid` is **fixed32**, not uint32.
-- `FriendMessagesClient.MessageAck#1`, `FriendMessagesClient.NotifyAckMessageEcho#1`: ignore.
+- `FriendMessages.AckMessage#1` (sent, no response) and `FriendMessagesClient.NotifyAckMessageEcho#1` (received): `CFriendMessages_AckMessage_Notification { fixed64 steamid_partner = 1; uint32 timestamp = 2; }`. Used only for message-meta UIs (see below).
 
 All field numbers above have been verified against the `.proto` files in
 https://github.com/SteamDatabase/Protobufs @ `60d634a` (directory `steam/`):
@@ -276,6 +276,34 @@ nothing new runs, and the output is exactly what it was.
   `[sticker: Name]` (their CDN path isn't verified); other tags are dropped
   with their content kept. Messages sent from another client of ours get
   the same treatment.
+
+- **Message ids and metadata.** Before each message it shows, the plugin
+  emits `receiving-message-meta(account, conv name, GHashTable *meta)`
+  (registered by pidgin4's libpurple) with `conv-type` = `im`, `sender`
+  (the friend's SteamID, or our account's username for our own messages),
+  `timestamp`, `stanza-id` and `server-id` (both the message id),
+  `outgoing` = `1` for our own messages from another client, `markable` =
+  `1` for the friend's messages, and `mam` = `1` + `mam-query` =
+  `catchup` for the offline history fetched at sign-on. A handler that sets
+  `discard` = `1` drops the message (the UI has it). **Message ids** are
+  `<friend SteamID>:<server timestamp>`, plus `:<ordinal>` when the ordinal
+  isn't 0: the conversation, timestamp and ordinal are what Steam's own
+  requests and notifications use to name a message.
+- **Own sends.** `send_im` returns 0 (libpurple writes nothing) and the
+  message is written from the `SendMessage` reply, right after
+  `sending-message-meta` with `conv-type`, `timestamp`, `stanza-id` and
+  `server-id` (the reply's `server_timestamp` and `ordinal`), so the UI
+  attaches the id to it. A failed send writes the text into the error.
+- **Read markers.** IPC `send-marker(account, conv name, message id,
+  marker)` (registered on the plugin only when the UI has message-meta)
+  sends `FriendMessages.AckMessage#1` (`CFriendMessages_AckMessage_Notification
+  { fixed64 steamid_partner = 1; uint32 timestamp = 2; }`, no response) for
+  `displayed`/`acknowledged`; Steam has no delivery receipts, so `received`
+  returns FALSE. The echo of an ack from another session of ours,
+  `FriendMessagesClient.NotifyAckMessageEcho#1` (same message), becomes
+  `message-receipt(account, friend, "<friend>:<timestamp>", "displayed",
+  <our username>)`. Steam doesn't tell us when the friend reads our
+  messages.
 
 ## Testing without a Steam account
 

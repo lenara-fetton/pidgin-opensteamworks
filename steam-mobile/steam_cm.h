@@ -193,6 +193,11 @@ typedef struct {
 	/* ClientAddFriendResponse. `persona_name` may be NULL. */
 	void (*add_friend_response)(SteamCM *cm, SteamEResult eresult, guint64 steamid,
 	                            const gchar *persona_name, gpointer user_data);
+
+	/* FriendMessagesClient.NotifyAckMessageEcho: another session of ours
+	 * read the conversation with `steamid_partner` up to `timestamp`. */
+	void (*ack_echo)(SteamCM *cm, guint64 steamid_partner, guint32 timestamp,
+	                 gpointer user_data);
 } SteamCMCallbacks;
 
 SteamCM *steam_cm_new(SteamAccount *sa, const SteamCMCallbacks *callbacks,
@@ -236,6 +241,19 @@ typedef void (*SteamCMSendMessageFunc)(SteamCM *cm, SteamEResult eresult,
 void steam_cm_send_message(SteamCM *cm, guint64 steamid, SteamChatEntryType type,
                            const gchar *message, SteamCMSendMessageFunc callback,
                            gpointer user_data);
+
+/* The same, with the message's ordinal from the reply (0 when absent or on
+ * failure); the server timestamp and ordinal identify the message. */
+typedef void (*SteamCMSendMessageFullFunc)(SteamCM *cm, SteamEResult eresult,
+                                           guint32 server_timestamp, guint32 ordinal,
+                                           gpointer user_data);
+void steam_cm_send_message_full(SteamCM *cm, guint64 steamid, SteamChatEntryType type,
+                                const gchar *message, SteamCMSendMessageFullFunc callback,
+                                gpointer user_data);
+
+/* FriendMessages.AckMessage: we have read the conversation with
+ * `steamid_partner` up to the message at `timestamp`. No reply. */
+void steam_cm_ack_message(SteamCM *cm, guint64 steamid_partner, guint32 timestamp);
 
 /* FriendMessages.GetRecentMessages for one conversation, newest first as
  * returned by Steam. `since` is a unix time (0 for none). */

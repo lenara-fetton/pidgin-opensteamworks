@@ -168,6 +168,8 @@ const char *steam_emsg_to_string(guint32 emsg);
 #define STEAM_METHOD_FRIEND_MESSAGES_GET_ACTIVE_SESSIONS "FriendMessages.GetActiveMessageSessions#1"
 #define STEAM_METHOD_PLAYER_GET_NICKNAME_LIST            "Player.GetNicknameList#1"
 #define STEAM_NOTIFY_FRIEND_MESSAGES_INCOMING_MESSAGE    "FriendMessagesClient.IncomingMessage#1"
+#define STEAM_METHOD_FRIEND_MESSAGES_ACK_MESSAGE         "FriendMessages.AckMessage#1"
+#define STEAM_NOTIFY_FRIEND_MESSAGES_ACK_ECHO            "FriendMessagesClient.NotifyAckMessageEcho#1"
 
 /* ======================================================================
  * Base (steammessages_base.proto)
@@ -750,6 +752,22 @@ void steam_msg_friend_messages_get_active_message_sessions_response_init(SteamMs
 void steam_msg_friend_messages_get_active_message_sessions_response_clear(SteamMsgFriendMessagesGetActiveMessageSessionsResponse *m);
 void steam_msg_friend_messages_get_active_message_sessions_response_encode(const SteamMsgFriendMessagesGetActiveMessageSessionsResponse *m, GByteArray *out);
 gboolean steam_msg_friend_messages_get_active_message_sessions_response_decode(SteamMsgFriendMessagesGetActiveMessageSessionsResponse *m, const guint8 *data, gsize len);
+
+/* CFriendMessages_AckMessage_Notification: sent as FriendMessages.AckMessage#1
+ * (we have read the conversation up to `timestamp`; no response), received
+ * as FriendMessagesClient.NotifyAckMessageEcho#1 (another session of ours
+ * did). */
+typedef struct {
+	gboolean has_steamid_partner;  /* 1 fixed64 */
+	guint64 steamid_partner;
+	gboolean has_timestamp;        /* 2 uint32 unix time of the newest message read */
+	guint32 timestamp;
+} SteamMsgFriendMessagesAckMessage;
+
+void steam_msg_friend_messages_ack_message_init(SteamMsgFriendMessagesAckMessage *m);
+void steam_msg_friend_messages_ack_message_clear(SteamMsgFriendMessagesAckMessage *m);
+void steam_msg_friend_messages_ack_message_encode(const SteamMsgFriendMessagesAckMessage *m, GByteArray *out);
+gboolean steam_msg_friend_messages_ack_message_decode(SteamMsgFriendMessagesAckMessage *m, const guint8 *data, gsize len);
 
 /* ======================================================================
  * Player service (steammessages_player.steamclient.proto)

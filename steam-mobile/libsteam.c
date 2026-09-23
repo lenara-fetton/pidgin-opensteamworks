@@ -880,7 +880,133 @@ steam_native_init(SteamAccount *sa)
 	sa->native_meta = ui_info != NULL &&
 		purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1");
 	if (sa->native_meta)
-		purple_debug_info("steam", "UI supports message-meta: inline images and emoticons\n");
+		purple_debug_info("steam", "UI supports message-meta: inline images and emoticons, "
+		                  "message ids, read markers\n");
+}
+
+/*
+ * Message metadata (native_meta only). Before each message it shows, the
+ * plugin emits
+ *
+ *   receiving-message-meta (account, conv name, GHashTable *meta)
+ *
+ * on the conversations handle. Keys: conv-type ("im"), sender (the
+ * friend's SteamID, or our account's username for our own messages),
+ * timestamp (unix seconds), stanza-id and server-id (both the message id
+ * below), outgoing ("1": sent by us from another client), markable ("1":
+ * the UI may send a read marker for it) and, for history, mam ("1") and
+ * mam-query ("catchup" at sign-on, "older" for scroll-back). A handler may
+ * set discard = "1": the UI has the message already and it isn't shown.
+ *
+ * Message ids are "<friend SteamID>:<server timestamp>", plus
+ * ":<ordinal>" when the ordinal isn't 0 (messages within one second).
+ * Steam names a message by the conversation, its server timestamp and its
+ * ordinal, so the id can be rebuilt from anything that refers to it:
+ * AckMessage, UpdateMessageReaction and the MessageReaction notification.
+ */
+
+static gchar *
+steam_message_id(guint64 friend_steamid, guint32 timestamp, guint32 ordinal)
+{
+	if (ordinal)
+		return g_strdup_printf("%" G_GUINT64_FORMAT ":%u:%u", friend_steamid, timestamp, ordinal);
+	return g_strdup_printf("%" G_GUINT64_FORMAT ":%u", friend_steamid, timestamp);
+}
+
+static gboolean
+steam_message_id_part(const gchar *s, guint32 *value)
+{
+	const gchar *p;
+	guint64 v;
+
+	if (s == NULL || *s == '\0' || strlen(s) > 10)
+		return FALSE;
+	for (p = s; *p; p++) {
+		if (!g_ascii_isdigit(*p))
+			return FALSE;
+	}
+	v = g_ascii_strtoull(s, NULL, 10);
+	if (v > G_MAXUINT32)
+		return FALSE;
+	*value = (guint32) v;
+	return TRUE;
+}
+
+/* Splits an id made by steam_message_id() */
+static gboolean
+steam_message_id_parse(const gchar *id, guint64 *friend_steamid, guint32 *timestamp, guint32 *ordinal)
+{
+	gchar **parts;
+	guint n;
+	gboolean ok;
+
+	if (id == NULL)
+		return FALSE;
+	parts = g_strsplit(id, ":", 4);
+	n = g_strv_length(parts);
+	*ordinal = 0;
+	ok = (n == 2 || n == 3) &&
+	     (*friend_steamid = steam_str_to_id(parts[0])) != 0 &&
+	     steam_message_id_part(parts[1], timestamp) && *timestamp != 0 &&
+	     (n == 2 || steam_message_id_part(parts[2], ordinal));
+	g_strfreev(parts);
+	return ok;
+}
+
+static void
+steam_meta_set(GHashTable *meta, const gchar *key, const gchar *value)
+{
+	if (value != NULL)
+		g_hash_table_replace(meta, g_strdup(key), g_strdup(value));
+}
+
+/* The receiving-message-meta table of a message in the conversation with
+ * `who`. `mam_query` is NULL for live messages. */
+static GHashTable *
+steam_message_meta_new(SteamAccount *sa, const gchar *who, guint32 timestamp, guint32 ordinal,
+		gboolean outgoing, const gchar *mam_query)
+{
+	GHashTable *meta = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+
+	steam_meta_set(meta, "conv-type", "im");
+	steam_meta_set(meta, "sender", outgoing ? purple_account_get_username(sa->account) : who);
+	if (outgoing)
+		steam_meta_set(meta, "outgoing", "1");
+	else
+		steam_meta_set(meta, "markable", "1");
+
+	if (timestamp) {
+		gchar *ts = g_strdup_printf("%u", timestamp);
+		gchar *id = steam_message_id(steam_str_to_id(who), timestamp, ordinal);
+
+		steam_meta_set(meta, "timestamp", ts);
+		steam_meta_set(meta, "stanza-id", id);
+		steam_meta_set(meta, "server-id", id);
+		g_free(id);
+		g_free(ts);
+	}
+
+	if (mam_query != NULL) {
+		steam_meta_set(meta, "mam", "1");
+		steam_meta_set(meta, "mam-query", mam_query);
+	}
+
+	return meta;
+}
+
+/* Emits receiving-message-meta for the write that follows and takes
+ * `meta`. Returns TRUE when the UI asked for the message to be dropped. */
+static gboolean
+steam_emit_message_meta(SteamAccount *sa, const gchar *who, GHashTable *meta)
+{
+	gboolean discard;
+
+	purple_signal_emit(purple_conversations_get_handle(), "receiving-message-meta",
+	                   sa->account, who, meta);
+	discard = purple_strequal(g_hash_table_lookup(meta, "discard"), "1");
+	g_hash_table_unref(meta);
+
+	return discard;
 }
 
 /* Remembers the first live message shown for `who` since the last logon,
@@ -1004,6 +1130,7 @@ steam_ensure_buddy(SteamAccount *sa, const gchar *who, gboolean *added)
 typedef struct {
 	SteamAccount *sa;
 	gchar *who;
+	gchar *html;   /* native_meta: what is shown once Steam has it, else NULL */
 } SteamSendContext;
 
 /******************************************************************************/
@@ -1406,7 +1533,11 @@ steam_got_history_cb(SteamCM *cm, guint64 friend_steamid,
 		// Fetched with bbcode_format for message-meta UIs
 		html = sa->native_meta ? steam_rich_to_html(message->message, TRUE, NULL)
 		                       : steam_text_to_html(message->message);
-		if (message->accountid == own_accountid) {
+		if (sa->native_meta && steam_emit_message_meta(sa, who,
+				steam_message_meta_new(sa, who, message->timestamp, message->ordinal,
+				                       message->accountid == own_accountid, "catchup"))) {
+			// The UI has it already
+		} else if (message->accountid == own_accountid) {
 			steam_write_sent_message(sa, who, html, PURPLE_MESSAGE_DELAYED, message->timestamp);
 		} else {
 			serv_got_im(sa->pc, who, html, PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_DELAYED, message->timestamp);
@@ -1919,10 +2050,15 @@ steam_cm_message_cb(SteamCM *cm, const SteamCMMessage *message, gpointer user_da
 			}
 
 			html = steam_message_to_html(sa, message->message_bbcode, message->message);
-			if (message->local_echo) {
+			if (!message->local_echo)
+				serv_got_typing_stopped(sa->pc, who);
+			if (sa->native_meta && steam_emit_message_meta(sa, who,
+					steam_message_meta_new(sa, who, message->timestamp, message->ordinal,
+					                       message->local_echo, NULL))) {
+				// The UI has it already
+			} else if (message->local_echo) {
 				steam_write_sent_message(sa, who, html, 0, timestamp);
 			} else {
-				serv_got_typing_stopped(sa->pc, who);
 				serv_got_im(sa->pc, who, html, PURPLE_MESSAGE_RECV, timestamp);
 			}
 			g_free(html);
@@ -2078,6 +2214,25 @@ steam_cm_add_friend_response_cb(SteamCM *cm, SteamEResult eresult, guint64 steam
 	}
 }
 
+/* Another session of ours read the conversation (native_meta only) */
+static void
+steam_cm_ack_echo_cb(SteamCM *cm, guint64 steamid_partner, guint32 timestamp, gpointer user_data)
+{
+	SteamAccount *sa = user_data;
+	gchar who[STEAM_ID_STR_LEN];
+	gchar *id;
+
+	if (!sa->native_meta)
+		return;
+
+	steam_id_to_str(steamid_partner, who);
+	id = steam_message_id(steamid_partner, timestamp, 0);
+	purple_signal_emit_return_1(purple_conversations_get_handle(), "message-receipt",
+	                            sa->account, who, id, "displayed",
+	                            purple_account_get_username(sa->account));
+	g_free(id);
+}
+
 static const SteamCMCallbacks steam_cm_callbacks = {
 	steam_cm_logged_on_cb,
 	steam_cm_logon_failed_cb,
@@ -2088,6 +2243,7 @@ static const SteamCMCallbacks steam_cm_callbacks = {
 	steam_cm_message_cb,
 	steam_cm_nicknames_cb,
 	steam_cm_add_friend_response_cb,
+	steam_cm_ack_echo_cb,
 };
 
 /******************************************************************************/
@@ -2605,6 +2761,7 @@ static void steam_close(PurpleConnection *pc)
 		SteamSendContext *ctx = sa->pending_sends->data;
 		sa->pending_sends = g_slist_remove(sa->pending_sends, ctx);
 		g_free(ctx->who);
+		g_free(ctx->html);
 		g_free(ctx);
 	}
 
@@ -2857,7 +3014,8 @@ steam_sent_message_expired(gpointer key, gpointer value, gpointer user_data)
 }
 
 static void
-steam_send_im_cb(SteamCM *cm, SteamEResult eresult, guint32 server_timestamp, gpointer user_data)
+steam_send_im_cb(SteamCM *cm, SteamEResult eresult, guint32 server_timestamp, guint32 ordinal,
+		gpointer user_data)
 {
 	SteamSendContext *ctx = user_data;
 	SteamAccount *sa = ctx->sa;
@@ -2866,12 +3024,42 @@ steam_send_im_cb(SteamCM *cm, SteamEResult eresult, guint32 server_timestamp, gp
 	sa->pending_sends = g_slist_remove(sa->pending_sends, ctx);
 
 	if (eresult == STEAM_ERESULT_OK) {
-		// Shown in the conversation when it was sent
+		// Shown in the conversation when it was sent, or (native_meta) now
 		steam_note_live_message(sa, who, server_timestamp);
 		steam_update_last_message_timestamp(sa, server_timestamp);
+
+		if (ctx->html != NULL) {
+			GHashTable *meta = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+
+			steam_meta_set(meta, "conv-type", "im");
+			if (server_timestamp) {
+				gchar *ts = g_strdup_printf("%u", server_timestamp);
+				gchar *id = steam_message_id(steam_str_to_id(who), server_timestamp, ordinal);
+
+				steam_meta_set(meta, "timestamp", ts);
+				steam_meta_set(meta, "stanza-id", id);
+				steam_meta_set(meta, "server-id", id);
+				g_free(id);
+				g_free(ts);
+			}
+			// The write below takes the ids
+			purple_signal_emit(purple_conversations_get_handle(), "sending-message-meta",
+			                   sa->account, who, meta);
+			g_hash_table_unref(meta);
+			steam_write_sent_message(sa, who, ctx->html, 0,
+					server_timestamp ? (time_t) server_timestamp : time(NULL));
+		}
 	} else {
 		const gchar *reason = steam_eresult_to_string(eresult);
-		gchar *error = g_strdup_printf(_("Message could not be sent: %s"), reason ? reason : _("unknown error"));
+		gchar *error;
+
+		if (ctx->html != NULL) {
+			// Not shown yet: keep the text in the error
+			error = g_strdup_printf(_("Message could not be sent (%s): %s"),
+					reason ? reason : _("unknown error"), ctx->html);
+		} else {
+			error = g_strdup_printf(_("Message could not be sent: %s"), reason ? reason : _("unknown error"));
+		}
 
 		purple_debug_error("steam", "sending message to %s failed: %d\n", who, eresult);
 		if (!purple_conv_present_error(who, sa->account, error))
@@ -2882,6 +3070,7 @@ steam_send_im_cb(SteamCM *cm, SteamEResult eresult, guint32 server_timestamp, gp
 	}
 
 	g_free(who);
+	g_free(ctx->html);
 	g_free(ctx);
 }
 
@@ -2909,15 +3098,21 @@ steam_send_im(PurpleConnection *pc, const gchar *who, const gchar *msg,
 	ctx = g_new0(SteamSendContext, 1);
 	ctx->sa = sa;
 	ctx->who = g_strdup(who);
+	if (sa->native_meta) {
+		// Shown when Steam has it, with its id (and emoticons/images as
+		// they are shown to the friend)
+		ctx->html = steam_rich_to_html(text, FALSE, NULL);
+	}
 	sa->pending_sends = g_slist_prepend(sa->pending_sends, ctx);
 
-	steam_cm_send_message(sa->cm, steamid, STEAM_CHAT_ENTRY_CHAT_MSG, text, steam_send_im_cb, ctx);
+	steam_cm_send_message_full(sa->cm, steamid, STEAM_CHAT_ENTRY_CHAT_MSG, text, steam_send_im_cb, ctx);
 
 	// Sending a message ends the typing notification
 	g_hash_table_remove(sa->typing_sent, who);
 	g_free(text);
 
-	return 1;
+	// native_meta: nothing to write yet (steam_send_im_cb does)
+	return sa->native_meta ? 0 : 1;
 }
 
 static void
@@ -3128,6 +3323,97 @@ steam_node_menu(PurpleBlistNode *node)
 }
 
 /******************************************************************************/
+/* IPC for message-meta UIs */
+/******************************************************************************/
+
+/*
+ * Registered on the plugin when the UI has message-meta (see
+ * steam_native_init()), with the signatures of the XMPP prpl's (M8):
+ *
+ *   gboolean send-marker (PurpleAccount *, const char *conv_name,
+ *                         const char *message_id, const char *marker)
+ *
+ * They return FALSE unless the account is a connected Steam account on a
+ * message-meta UI and the arguments name a Steam message.
+ */
+
+static gboolean
+steam_ui_has_message_meta(void)
+{
+	GHashTable *ui_info = purple_core_get_ui_info();
+
+	return ui_info != NULL && purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1");
+}
+
+static SteamAccount *
+steam_ipc_account(PurpleAccount *account)
+{
+	PurpleConnection *pc;
+	SteamAccount *sa;
+
+	if (account == NULL || !purple_strequal(purple_account_get_protocol_id(account), STEAM_PLUGIN_ID))
+		return NULL;
+	pc = purple_account_get_connection(account);
+	if (pc == NULL || !PURPLE_CONNECTION_IS_CONNECTED(pc))
+		return NULL;
+	sa = pc->proto_data;
+	if (sa == NULL || !sa->native_meta || sa->cm == NULL || !steam_cm_is_logged_on(sa->cm))
+		return NULL;
+	return sa;
+}
+
+/* The message `message_id` in the conversation `conv_name` */
+static gboolean
+steam_ipc_message(const gchar *conv_name, const gchar *message_id, guint64 *friend_steamid,
+		guint32 *timestamp, guint32 *ordinal)
+{
+	guint64 conv_steamid = steam_str_to_id(conv_name);
+
+	return conv_steamid != 0 &&
+	       steam_message_id_parse(message_id, friend_steamid, timestamp, ordinal) &&
+	       *friend_steamid == conv_steamid;
+}
+
+/* A read marker: FriendMessages.AckMessage with the message's timestamp.
+ * Steam has no delivery receipts, so only "displayed" (the default) and
+ * "acknowledged" are sent. */
+static gboolean
+steam_ipc_send_marker(PurpleAccount *account, const gchar *conv_name, const gchar *message_id,
+		const gchar *marker)
+{
+	SteamAccount *sa = steam_ipc_account(account);
+	guint64 friend_steamid;
+	guint32 timestamp, ordinal;
+
+	if (sa == NULL || !steam_ipc_message(conv_name, message_id, &friend_steamid, &timestamp, &ordinal))
+		return FALSE;
+	if (marker != NULL && *marker && !purple_strequal(marker, "displayed") &&
+	    !purple_strequal(marker, "acknowledged"))
+		return FALSE;
+
+	steam_cm_ack_message(sa->cm, friend_steamid, timestamp);
+	return TRUE;
+}
+
+static void
+steam_ipc_register(PurplePlugin *plugin)
+{
+	if (!steam_ui_has_message_meta())
+		return;
+
+	purple_plugin_ipc_register(plugin, "send-marker",
+			PURPLE_CALLBACK(steam_ipc_send_marker),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	purple_debug_info("steam", "UI has message-meta: registered IPC command send-marker\n");
+}
+
+/******************************************************************************/
 /* Plugin functions */
 /******************************************************************************/
 
@@ -3187,6 +3473,8 @@ static gboolean plugin_load(PurplePlugin *plugin)
 #endif // USE_GNOME_KEYRING
 
 #endif
+
+	steam_ipc_register(plugin);
 
 	return TRUE;
 }

@@ -1769,6 +1769,40 @@ steam_msg_friend_messages_get_active_message_sessions_response_decode(SteamMsgFr
 }
 
 /* ======================================================================
+ * CFriendMessages_AckMessage_Notification
+ * ====================================================================== */
+
+void
+steam_msg_friend_messages_ack_message_init(SteamMsgFriendMessagesAckMessage *m)
+{
+	memset(m, 0, sizeof(*m));
+}
+
+void
+steam_msg_friend_messages_ack_message_clear(SteamMsgFriendMessagesAckMessage *m)
+{
+}
+
+void
+steam_msg_friend_messages_ack_message_encode(const SteamMsgFriendMessagesAckMessage *m, GByteArray *o)
+{
+	W_FIXED64(o, 1, m, steamid_partner);
+	W_U32(o, 2, m, timestamp);
+}
+
+gboolean
+steam_msg_friend_messages_ack_message_decode(SteamMsgFriendMessagesAckMessage *m, const guint8 *data, gsize len)
+{
+	steam_msg_friend_messages_ack_message_init(m);
+	{
+	DECODE_BEGIN(r, data, len)
+		case 1: R_FIXED64(&r, m, steamid_partner); break;
+		case 2: R_U32(&r, m, timestamp); break;
+	DECODE_END(r)
+	}
+}
+
+/* ======================================================================
  * CPlayer_GetNicknameList_Request / Response
  * ====================================================================== */
 
