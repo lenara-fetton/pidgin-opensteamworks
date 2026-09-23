@@ -1,2 +1,7 @@
 *.o
 *.so
+steam-mobile/tests/test_proto
+steam-mobile/tests/test_ws
+steam-mobile/tests/test_auth
+steam-mobile/tests/test_cm
+steam-mobile/tests/test_load

@@ -1,13 +1,15 @@
 %global plugin_name libsteam
 %global dir_name steam-mobile
 
-%global commit0 0f51fd6219b80aed9c466d1461a076fc2403a1a3
+# TODO(maintainer): fill in the commit this tarball is built from once 2.0
+# is tagged/released, e.g.:
+%global commit0 REPLACE_WITH_RELEASE_COMMIT
 %global shortcommit0 %(c=%{commit0}; echo ${c:0:7})
-%global date 20160618
+%global date 20260101
 
 Name: purple-%{plugin_name}
-Version: 1.6.1
-Release: 12.%{date}git%{shortcommit0}%{?dist}
+Version: 2.0
+Release: 1.%{date}git%{shortcommit0}%{?dist}
 Summary: Steam plugin for Pidgin/Adium/libpurple
 
 License: GPLv3
@@ -19,7 +21,6 @@ BuildRequires: pkgconfig(purple)
 BuildRequires: pkgconfig(json-glib-1.0)
 BuildRequires: pkgconfig(zlib)
 BuildRequires: pkgconfig(nss)
-BuildRequires: pkgconfig(gnome-keyring-1)
 BuildRequires: gcc
 
 %package -n pidgin-%{plugin_name}
@@ -61,6 +62,12 @@ chmod 755 %{buildroot}%{_libdir}/purple-2/%{plugin_name}.so
 %{_datadir}/pixmaps/pidgin/protocols/*/steam.png
 
 %changelog
+* Tue Sep 22 2026 Lenara Fetton <lenara@minowick.com> - 2.0-1.20260101gitREPLACE_WITH_RELEASE_COMMIT
+- Update to 2.0: rewritten protocol layer using IAuthenticationService
+  login (password + Steam Guard) and the CM WebSocket protocol.
+- Drop gnome-keyring-1 BuildRequires; libsecret is loaded at runtime, not
+  linked at build time.
+
 * Tue Jun 21 2016 Vitaly Zaitsev <vitaly@easycoding.org> - 1.6.1-12.20160618git0f51fd6
 - Updated to latest Git snapshot. Added missing LDFLAGS to %build.
 

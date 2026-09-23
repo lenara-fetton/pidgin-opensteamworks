@@ -132,9 +132,12 @@ steam_connection_close(SteamConnection *steamcon)
 		purple_input_remove(steamcon->input_watcher);
 		steamcon->input_watcher = 0;
 	}
-	
-	purple_timeout_remove(steamcon->timeout_watcher);
-	
+
+	if (steamcon->timeout_watcher > 0) {
+		purple_timeout_remove(steamcon->timeout_watcher);
+		steamcon->timeout_watcher = 0;
+	}
+
 	g_free(steamcon->rx_buf);
 	steamcon->rx_buf = NULL;
 	steamcon->rx_len = 0;
@@ -172,36 +175,216 @@ static void steam_update_cookies(SteamAccount *sa, const gchar *headers)
 	{
 		cookie_start += 14;
 		cookie_end = strchr(cookie_start, '=');
+		if (cookie_end == NULL)
+			break; /* malformed Set-Cookie header, nothing more to parse */
 		cookie_name = g_strndup(cookie_start, cookie_end-cookie_start);
 		cookie_start = cookie_end + 1;
 		cookie_end = strchr(cookie_start, ';');
-		cookie_value= g_strndup(cookie_start, cookie_end-cookie_start);
-		cookie_start = cookie_end;
+		if (cookie_end == NULL) {
+			/* last cookie on the line, no trailing attributes */
+			cookie_value = g_strdup(cookie_start);
+			cookie_start = cookie_start + strlen(cookie_start);
+		} else {
+			cookie_value = g_strndup(cookie_start, cookie_end-cookie_start);
+			cookie_start = cookie_end;
+		}
 
 		g_hash_table_replace(sa->cookie_table, cookie_name,
 				cookie_value);
 	}
 }
 
+/*
+ * HTTP 429 back-off bookkeeping.
+ *
+ * On a 429 for a JSON (non-raw) request, steam_connection_process_data()
+ * duplicates the SteamConnection and schedules it to be requeued after a
+ * 1-second delay via purple_timeout_add_seconds(). That timer id is not
+ * stored anywhere else (SteamConnection/SteamAccount are owned by
+ * libsteam.c/steam_connection.h and we cannot add a field to either without
+ * touching files owned by other agents), so if the account is closed within
+ * that second the timer fires against a freed SteamAccount/SteamConnection.
+ *
+ * To fix this without touching libsteam.h, keep our own registry here,
+ * keyed by the duplicated SteamConnection pointer (which is unique and
+ * stable for the lifetime of the pending timer). steam_connection_cancel_all()
+ * (and steam_connection_cancel_requeues()) sweep this table for a given
+ * SteamAccount and cancel the timers before the account can be freed; the
+ * timer callback itself also re-checks the table before touching `sa`.
+ */
+typedef struct {
+	SteamAccount *sa;
+	guint timer_id;
+} SteamRequeueEntry;
+
+/* SteamConnection* (the g_memdup2'd, detached duplicate) -> SteamRequeueEntry* */
+static GHashTable *steam_requeue_registry = NULL;
+
+static GHashTable *
+steam_connection_requeue_registry(void)
+{
+	if (steam_requeue_registry == NULL)
+		steam_requeue_registry = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+				NULL, g_free);
+	return steam_requeue_registry;
+}
+
+/* Frees a duplicated SteamConnection that was cancelled before its requeue
+ * timer fired. It was never linked into sa->conns/waiting_conns and shares
+ * its fd/ssl_conn/watcher ids with the (already destroyed) original
+ * connection, so this only frees what the duplicate exclusively owns. */
+static void
+steam_connection_requeue_dup_free(SteamConnection *steamcon)
+{
+	if (steamcon == NULL)
+		return;
+	if (steamcon->request != NULL)
+		g_string_free(steamcon->request, TRUE);
+	g_free(steamcon->url);
+	g_free(steamcon->hostname);
+	g_free(steamcon->rx_buf);
+	g_free(steamcon);
+}
+
+/* Cancels every pending HTTP 429 requeue timer belonging to `sa` and frees
+ * the duplicated SteamConnections they were going to requeue. Safe to call
+ * even if none are pending. */
+void
+steam_connection_cancel_requeues(SteamAccount *sa)
+{
+	GHashTableIter iter;
+	gpointer key, value;
+	GSList *to_remove = NULL, *l;
+
+	if (sa == NULL || steam_requeue_registry == NULL)
+		return;
+
+	g_hash_table_iter_init(&iter, steam_requeue_registry);
+	while (g_hash_table_iter_next(&iter, &key, &value)) {
+		SteamRequeueEntry *entry = value;
+		if (entry->sa == sa)
+			to_remove = g_slist_prepend(to_remove, key);
+	}
+
+	for (l = to_remove; l != NULL; l = l->next) {
+		SteamConnection *steamcon_dup = l->data;
+		SteamRequeueEntry *entry = g_hash_table_lookup(steam_requeue_registry, steamcon_dup);
+
+		if (entry != NULL) {
+			purple_timeout_remove(entry->timer_id);
+			g_hash_table_remove(steam_requeue_registry, steamcon_dup);
+		}
+		steam_connection_requeue_dup_free(steamcon_dup);
+	}
+	g_slist_free(to_remove);
+}
+
+/* Destroys every connection (in-flight, queued, and pending HTTP 429
+ * requeue) belonging to `sa`, without invoking any callback. Intended to be
+ * called from steam_close() so nothing outlives the SteamAccount. */
+void
+steam_connection_cancel_all(SteamAccount *sa)
+{
+	if (sa == NULL)
+		return;
+
+	steam_connection_cancel_requeues(sa);
+
+	if (sa->waiting_conns != NULL) {
+		while (!g_queue_is_empty(sa->waiting_conns))
+			steam_connection_destroy(g_queue_pop_tail(sa->waiting_conns));
+	}
+
+	while (sa->conns != NULL)
+		steam_connection_destroy(sa->conns->data);
+}
+
 static gboolean
 steam_connection_requeue_delay(gpointer data)
 {
 	SteamConnection *steamcon = data;
-	
-	if (steamcon && steamcon->sa && steamcon->sa->waiting_conns)
+	SteamRequeueEntry *entry = NULL;
+
+	/* Validity check: if steam_connection_cancel_requeues()/cancel_all()
+	 * already ran for this account (e.g. the account was closed within the
+	 * 1-second back-off), our entry is gone and steamcon/sa may be freed --
+	 * do not touch them. */
+	if (steam_requeue_registry != NULL)
+		entry = g_hash_table_lookup(steam_requeue_registry, steamcon);
+
+	if (entry == NULL)
+		return FALSE;
+
+	g_hash_table_steal(steam_requeue_registry, steamcon);
+	g_free(entry);
+
+	if (steamcon && steamcon->sa && steamcon->sa->waiting_conns) {
 		g_queue_push_head(steamcon->sa->waiting_conns, steamcon);
-	
+		steam_next_connection(steamcon->sa);
+	} else {
+		steam_connection_requeue_dup_free(steamcon);
+	}
+
 	return FALSE;
+}
+
+gchar *
+steam_connection_get_header(const gchar *headers, const gchar *name)
+{
+	const gchar *line;
+	gsize name_len;
+
+	if (headers == NULL || name == NULL)
+		return NULL;
+
+	name_len = strlen(name);
+	/* skip the status line */
+	line = strstr(headers, "\r\n");
+	while (line != NULL) {
+		const gchar *eol;
+
+		line += 2;
+		eol = strstr(line, "\r\n");
+		if (eol == NULL)
+			eol = line + strlen(line);
+		if (eol == line)
+			break; /* blank line: end of headers */
+
+		if ((gsize)(eol - line) > name_len && line[name_len] == ':' &&
+				g_ascii_strncasecmp(line, name, name_len) == 0) {
+			gchar *value = g_strndup(line + name_len + 1, eol - (line + name_len + 1));
+			return g_strstrip(value);
+		}
+
+		line = (*eol != '\0') ? eol : NULL;
+	}
+
+	return NULL;
+}
+
+guint
+steam_connection_get_status(const gchar *headers)
+{
+	const gchar *sp;
+
+	if (headers == NULL || !g_str_has_prefix(headers, "HTTP/"))
+		return 0;
+	sp = strchr(headers, ' ');
+	if (sp == NULL)
+		return 0;
+	return (guint)strtoul(sp + 1, NULL, 10);
 }
 
 static void steam_connection_process_data(SteamConnection *steamcon)
 {
 	gssize len;
 	gchar *tmp;
+	gchar *header_end;
+	gboolean have_headers = FALSE;
 
 	len = steamcon->rx_len;
-	tmp = g_strstr_len(steamcon->rx_buf, len, "\r\n\r\n");
-	if (tmp == NULL) {
+	header_end = steamcon->rx_buf ? g_strstr_len(steamcon->rx_buf, len, "\r\n\r\n") : NULL;
+	if (header_end == NULL) {
 		/* This is a corner case that occurs when the connection is
 		 * prematurely closed either on the client or the server.
 		 * This can either be no data at all or a partial set of
@@ -211,45 +394,93 @@ static void steam_connection_process_data(SteamConnection *steamcon)
 		 */
 		tmp = g_strndup(steamcon->rx_buf, len);
 	} else {
-		tmp += 4;
-		len -= g_strstr_len(steamcon->rx_buf, len, "\r\n\r\n") -
-				steamcon->rx_buf + 4;
-		tmp = g_memdup(tmp, len + 1);
+		gchar *encoding;
+
+		have_headers = TRUE;
+		tmp = header_end + 4;
+		len -= header_end - steamcon->rx_buf + 4;
+		tmp = g_memdup2(tmp, len + 1);
 		tmp[len] = '\0';
-		steamcon->rx_buf[steamcon->rx_len - len] = '\0';
+		/* terminate the header block after its final "\r\n" */
+		header_end[2] = '\0';
 		steam_update_cookies(steamcon->sa, steamcon->rx_buf);
 
-		if (strstr(steamcon->rx_buf, "Content-Encoding: gzip"))
+		encoding = steam_connection_get_header(steamcon->rx_buf, "Content-Encoding");
+		if (encoding != NULL && g_ascii_strcasecmp(encoding, "gzip") == 0)
 		{
 			/* we've received compressed gzip data, decompress */
 			gchar *gunzipped;
 			gunzipped = steam_gunzip((const guchar *)tmp, &len);
 			g_free(tmp);
 			tmp = gunzipped;
+			if (tmp == NULL)
+				len = 0;
 		}
+		g_free(encoding);
 		
-		if (strstr(steamcon->rx_buf, "429 Too Many Requests")) {
+		if (steam_connection_get_status(steamcon->rx_buf) == 429 && steamcon->raw_callback == NULL) {
+			SteamConnection *steamcon_dup;
+			guint timer_id;
+
+			/* Raw (protobuf) callers are not retried transparently: they
+			 * get the 429 delivered like any other response (falls through
+			 * below) so they can map it themselves (e.g. steam_auth maps
+			 * it to RATE_LIMIT). Only JSON requests get the automatic
+			 * back-off-and-retry below, and only up to 3 attempts. */
+
+			steamcon->retry_count++;
+
 			g_free(steamcon->rx_buf);
 			steamcon->rx_buf = NULL;
 			steamcon->rx_len = 0;
 			g_free(tmp);
-			
+
+			if (steamcon->retry_count >= 3) {
+				purple_debug_error("steam", "giving up on %s after %u HTTP 429 retries\n",
+						steamcon->url, steamcon->retry_count);
+				if (steamcon->error_callback != NULL)
+					steamcon->error_callback(steamcon->sa, NULL, 0, steamcon->user_data);
+				return;
+			}
+
 			//We got rate-limited, try again
-			SteamConnection *steamcon_dup = g_memdup(steamcon, sizeof(SteamConnection));
+			steamcon_dup = g_memdup2(steamcon, sizeof(SteamConnection));
 			steamcon->request = NULL;
 			steamcon->url = NULL;
 			steamcon->hostname = NULL;
-			
-			purple_timeout_add_seconds(1, steam_connection_requeue_delay, steamcon_dup);
+
+			timer_id = purple_timeout_add_seconds(1, steam_connection_requeue_delay, steamcon_dup);
+			{
+				SteamRequeueEntry *entry = g_new(SteamRequeueEntry, 1);
+				entry->sa = steamcon->sa;
+				entry->timer_id = timer_id;
+				g_hash_table_insert(steam_connection_requeue_registry(), steamcon_dup, entry);
+			}
 			return;
 		}
+	}
+
+	if (steamcon->raw_callback != NULL) {
+		if (have_headers) {
+			purple_debug_info("steam", "executing raw callback for %s (%" G_GSSIZE_FORMAT " bytes)\n", steamcon->url, len);
+			steamcon->raw_callback(steamcon->sa, steamcon->rx_buf,
+					(const guint8 *)(tmp ? tmp : ""), tmp ? (gsize)len : 0,
+					steamcon->user_data);
+		} else {
+			purple_debug_error("steam", "No HTTP response headers from %s\n", steamcon->url);
+			steamcon->raw_callback(steamcon->sa, NULL, NULL, 0, steamcon->user_data);
+		}
+		g_free(steamcon->rx_buf);
+		steamcon->rx_buf = NULL;
+		g_free(tmp);
+		return;
 	}
 
 	g_free(steamcon->rx_buf);
 	steamcon->rx_buf = NULL;
 
 	if (steamcon->callback != NULL) {
-		if (!len)
+		if (!len || tmp == NULL)
 		{
 			purple_debug_error("steam", "No data in response\n");
 		} else {
@@ -281,6 +512,18 @@ static void steam_fatal_connection_cb(SteamConnection *steamcon)
 	PurpleConnection *pc = steamcon->sa->pc;
 
 	purple_debug_error("steam", "fatal connection error\n");
+
+	if (steamcon->raw_callback != NULL) {
+		/* Raw callers handle transport failures themselves */
+		SteamProxyCallbackRawFunc raw_callback = steamcon->raw_callback;
+		SteamAccount *sa = steamcon->sa;
+		gpointer user_data = steamcon->user_data;
+
+		steam_connection_destroy(steamcon);
+		raw_callback(sa, NULL, NULL, 0, user_data);
+		steam_next_connection(sa);
+		return;
+	}
 
 	steam_connection_destroy(steamcon);
 
@@ -542,6 +785,14 @@ static void steam_ssl_connection_error(PurpleSslConnection *ssl,
 		
 		g_queue_push_head(sa->waiting_conns, steamcon);
 		steam_next_connection(sa);
+	} else if (steamcon->raw_callback != NULL) {
+		SteamProxyCallbackRawFunc raw_callback = steamcon->raw_callback;
+		gpointer user_data = steamcon->user_data;
+
+		purple_debug_error("steam", "SSL error %d for %s\n", errortype, steamcon->url);
+		steam_connection_destroy(steamcon);
+		raw_callback(sa, NULL, NULL, 0, user_data);
+		steam_next_connection(sa);
 	} else {
 		steam_connection_destroy(steamcon);
 		purple_connection_ssl_error(pc, errortype);
@@ -673,6 +924,55 @@ steam_post_or_get(SteamAccount *sa, SteamMethod method,
 	steam_next_connection(sa);
 	
 	return steamcon;
+}
+
+guint
+steam_connection_cancel_by_user_data(SteamAccount *sa, gpointer user_data)
+{
+	GSList *l, *matches = NULL;
+	GList *ql;
+	guint count = 0;
+
+	g_return_val_if_fail(sa != NULL, 0);
+
+	if (sa->waiting_conns != NULL) {
+		for (ql = sa->waiting_conns->head; ql != NULL; ) {
+			SteamConnection *steamcon = ql->data;
+			GList *next = ql->next;
+			if (steamcon->user_data == user_data) {
+				g_queue_delete_link(sa->waiting_conns, ql);
+				matches = g_slist_prepend(matches, steamcon);
+			}
+			ql = next;
+		}
+	}
+	for (l = sa->conns; l != NULL; l = l->next) {
+		SteamConnection *steamcon = l->data;
+		if (steamcon->user_data == user_data)
+			matches = g_slist_prepend(matches, steamcon);
+	}
+
+	for (l = matches; l != NULL; l = l->next) {
+		purple_debug_info("steam", "cancelling request %s\n", ((SteamConnection *)l->data)->url);
+		steam_connection_destroy(l->data);
+		count++;
+	}
+	g_slist_free(matches);
+
+	/* Each cancelled entry may have freed up a connection slot (if it was
+	 * an in-flight sa->conns entry) or simply removed queued work (if it
+	 * was a sa->waiting_conns entry); either way more than one queued
+	 * request may now be able to start. steam_next_connection() only ever
+	 * starts one, so loop it while there is still room and queued work. */
+	while (count > 0 && !g_queue_is_empty(sa->waiting_conns) &&
+			g_slist_length(sa->conns) < STEAM_MAX_CONNECTIONS) {
+		guint before = g_slist_length(sa->conns);
+		steam_next_connection(sa);
+		if (g_slist_length(sa->conns) == before)
+			break; /* didn't actually start anything, avoid looping forever */
+	}
+
+	return count;
 }
 
 static void steam_next_connection(SteamAccount *sa)
