@@ -1596,20 +1596,116 @@ steam_msg_friend_messages_get_recent_messages_request_decode(SteamMsgFriendMessa
 }
 
 static void
+friend_message_reaction_clear(gpointer p)
+{
+	SteamMsgFriendMessageReaction *mr = p;
+
+	FREE_STR(mr->reaction);
+	FREE_ARRAY(mr->reactors);
+}
+
+static void
 friend_message_clear(gpointer p)
 {
 	SteamMsgFriendMessage *fm = p;
 
 	FREE_STR(fm->message);
+	FREE_ARRAY(fm->reactions);
+}
+
+SteamMsgFriendMessageReaction *
+steam_msg_friend_message_add_reaction(SteamMsgFriendMessage *fm)
+{
+	SteamMsgFriendMessageReaction mr;
+
+	if (fm->reactions == NULL) {
+		fm->reactions = g_array_new(FALSE, TRUE, sizeof(SteamMsgFriendMessageReaction));
+		g_array_set_clear_func(fm->reactions, friend_message_reaction_clear);
+	}
+	memset(&mr, 0, sizeof(mr));
+	mr.reactors = g_array_new(FALSE, TRUE, sizeof(guint32));
+	g_array_append_val(fm->reactions, mr);
+	return &g_array_index(fm->reactions, SteamMsgFriendMessageReaction, fm->reactions->len - 1);
+}
+
+static void
+friend_message_reaction_encode(const SteamMsgFriendMessageReaction *mr, GByteArray *o)
+{
+	guint i;
+
+	W_I32(o, 1, mr, reaction_type);
+	W_STR(o, 2, mr, reaction);
+	/* proto2 repeated without [packed=true]: one tag per element */
+	for (i = 0; mr->reactors && i < mr->reactors->len; i++)
+		steam_proto_put_varint(o, 3, g_array_index(mr->reactors, guint32, i));
+}
+
+/* Appends varint uint32 values of field `r` (either encoding) to `out` */
+static gboolean
+rd_repeated_u32(const SteamProtoReader *r, GArray *out)
+{
+	if (r->wt == STEAM_PROTO_WT_VARINT) {
+		guint32 v = (guint32) r->varint;
+
+		g_array_append_val(out, v);
+	} else if (r->wt == STEAM_PROTO_WT_LEN) {
+		/* packed encoding: parsers must accept both */
+		gsize pos = 0;
+
+		while (pos < r->bytes_len) {
+			guint64 v = 0;
+			guint shift = 0;
+			guint32 v32;
+
+			do {
+				if (pos >= r->bytes_len || shift > 63)
+					return FALSE;
+				v |= (guint64) (r->bytes[pos] & 0x7f) << shift;
+				shift += 7;
+			} while (r->bytes[pos++] & 0x80);
+			v32 = (guint32) v;
+			g_array_append_val(out, v32);
+		}
+	}
+	return TRUE;
+}
+
+static gboolean
+friend_message_reaction_decode(SteamMsgFriendMessage *fm, const SteamProtoReader *r)
+{
+	SteamMsgFriendMessageReaction *mr;
+	SteamProtoReader s;
+
+	if (r->wt != STEAM_PROTO_WT_LEN)
+		return TRUE;
+	mr = steam_msg_friend_message_add_reaction(fm);
+	steam_proto_sub_reader(r, &s);
+	while (steam_proto_next(&s)) {
+		switch (s.field) {
+		case 1: R_I32(&s, mr, reaction_type); break;
+		case 2: rd_string(&s, &mr->reaction); break;
+		case 3:
+			if (!rd_repeated_u32(&s, mr->reactors))
+				return FALSE;
+			break;
+		default: break;
+		}
+	}
+	return !s.error;
 }
 
 static void
 friend_message_encode(const SteamMsgFriendMessage *fm, GByteArray *o)
 {
+	guint i;
+
 	W_U32(o, 1, fm, accountid);
 	W_U32(o, 2, fm, timestamp);
 	W_STR(o, 3, fm, message);
 	W_U32(o, 4, fm, ordinal);
+	for (i = 0; fm->reactions && i < fm->reactions->len; i++)
+		W_SUB(o, 5, friend_message_reaction_encode,
+		      &g_array_index(fm->reactions, SteamMsgFriendMessageReaction, i));
 }
 
 void
@@ -1656,6 +1752,12 @@ steam_msg_friend_messages_get_recent_messages_response_decode(SteamMsgFriendMess
 					case 2: R_U32(&s, &fm, timestamp); break;
 					case 3: rd_string(&s, &fm.message); break;
 					case 4: R_U32(&s, &fm, ordinal); break;
+					case 5:
+						if (!friend_message_reaction_decode(&fm, &s)) {
+							g_array_append_val(m->messages, fm);
+							return FALSE;
+						}
+						break;
 					default: break;
 					}
 				}
@@ -1798,6 +1900,133 @@ steam_msg_friend_messages_ack_message_decode(SteamMsgFriendMessagesAckMessage *m
 	DECODE_BEGIN(r, data, len)
 		case 1: R_FIXED64(&r, m, steamid_partner); break;
 		case 2: R_U32(&r, m, timestamp); break;
+	DECODE_END(r)
+	}
+}
+
+/* ======================================================================
+ * CFriendMessages_UpdateMessageReaction_Request / Response
+ * ====================================================================== */
+
+void
+steam_msg_friend_messages_update_message_reaction_request_init(SteamMsgFriendMessagesUpdateMessageReactionRequest *m)
+{
+	memset(m, 0, sizeof(*m));
+}
+
+void
+steam_msg_friend_messages_update_message_reaction_request_clear(SteamMsgFriendMessagesUpdateMessageReactionRequest *m)
+{
+	FREE_STR(m->reaction);
+}
+
+void
+steam_msg_friend_messages_update_message_reaction_request_encode(const SteamMsgFriendMessagesUpdateMessageReactionRequest *m, GByteArray *o)
+{
+	W_FIXED64(o, 1, m, steamid);
+	W_U32(o, 2, m, server_timestamp);
+	W_U32(o, 3, m, ordinal);
+	W_I32(o, 4, m, reaction_type);
+	W_STR(o, 5, m, reaction);
+	W_BOOL(o, 6, m, is_add);
+}
+
+gboolean
+steam_msg_friend_messages_update_message_reaction_request_decode(SteamMsgFriendMessagesUpdateMessageReactionRequest *m, const guint8 *data, gsize len)
+{
+	steam_msg_friend_messages_update_message_reaction_request_clear(m);
+	steam_msg_friend_messages_update_message_reaction_request_init(m);
+	{
+	DECODE_BEGIN(r, data, len)
+		case 1: R_FIXED64(&r, m, steamid); break;
+		case 2: R_U32(&r, m, server_timestamp); break;
+		case 3: R_U32(&r, m, ordinal); break;
+		case 4: R_I32(&r, m, reaction_type); break;
+		case 5: rd_string(&r, &m->reaction); break;
+		case 6: R_BOOL(&r, m, is_add); break;
+	DECODE_END(r)
+	}
+}
+
+void
+steam_msg_friend_messages_update_message_reaction_response_init(SteamMsgFriendMessagesUpdateMessageReactionResponse *m)
+{
+	memset(m, 0, sizeof(*m));
+	m->reactors = g_array_new(FALSE, TRUE, sizeof(guint32));
+}
+
+void
+steam_msg_friend_messages_update_message_reaction_response_clear(SteamMsgFriendMessagesUpdateMessageReactionResponse *m)
+{
+	FREE_ARRAY(m->reactors);
+}
+
+void
+steam_msg_friend_messages_update_message_reaction_response_encode(const SteamMsgFriendMessagesUpdateMessageReactionResponse *m, GByteArray *o)
+{
+	guint i;
+
+	for (i = 0; i < m->reactors->len; i++)
+		steam_proto_put_varint(o, 1, g_array_index(m->reactors, guint32, i));
+}
+
+gboolean
+steam_msg_friend_messages_update_message_reaction_response_decode(SteamMsgFriendMessagesUpdateMessageReactionResponse *m, const guint8 *data, gsize len)
+{
+	steam_msg_friend_messages_update_message_reaction_response_clear(m);
+	steam_msg_friend_messages_update_message_reaction_response_init(m);
+	{
+	DECODE_BEGIN(r, data, len)
+		case 1:
+			if (!rd_repeated_u32(&r, m->reactors))
+				return FALSE;
+			break;
+	DECODE_END(r)
+	}
+}
+
+/* ======================================================================
+ * CFriendMessages_MessageReaction_Notification
+ * ====================================================================== */
+
+void
+steam_msg_friend_messages_message_reaction_init(SteamMsgFriendMessagesMessageReaction *m)
+{
+	memset(m, 0, sizeof(*m));
+}
+
+void
+steam_msg_friend_messages_message_reaction_clear(SteamMsgFriendMessagesMessageReaction *m)
+{
+	FREE_STR(m->reaction);
+}
+
+void
+steam_msg_friend_messages_message_reaction_encode(const SteamMsgFriendMessagesMessageReaction *m, GByteArray *o)
+{
+	W_FIXED64(o, 1, m, steamid_friend);
+	W_U32(o, 2, m, server_timestamp);
+	W_U32(o, 3, m, ordinal);
+	W_FIXED64(o, 4, m, reactor);
+	W_I32(o, 5, m, reaction_type);
+	W_STR(o, 6, m, reaction);
+	W_BOOL(o, 7, m, is_add);
+}
+
+gboolean
+steam_msg_friend_messages_message_reaction_decode(SteamMsgFriendMessagesMessageReaction *m, const guint8 *data, gsize len)
+{
+	steam_msg_friend_messages_message_reaction_clear(m);
+	steam_msg_friend_messages_message_reaction_init(m);
+	{
+	DECODE_BEGIN(r, data, len)
+		case 1: R_FIXED64(&r, m, steamid_friend); break;
+		case 2: R_U32(&r, m, server_timestamp); break;
+		case 3: R_U32(&r, m, ordinal); break;
+		case 4: R_FIXED64(&r, m, reactor); break;
+		case 5: R_I32(&r, m, reaction_type); break;
+		case 6: rd_string(&r, &m->reaction); break;
+		case 7: R_BOOL(&r, m, is_add); break;
 	DECODE_END(r)
 	}
 }

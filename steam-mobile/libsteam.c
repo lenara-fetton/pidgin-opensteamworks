@@ -33,6 +33,7 @@ static gboolean core_is_haze = FALSE;
 static PurplePlugin *steam_plugin = NULL;   /* this prpl, for its signals */
 static gboolean steam_signals_registered = FALSE;
 static void steam_older_fetch_free(SteamOlderFetch *fetch);
+static void steam_reaction_update_free(SteamReactionUpdate *update);
 
 // Hack to fix OSX compatibility :)
 #ifdef __APPLE__
@@ -882,9 +883,12 @@ steam_native_init(SteamAccount *sa)
 
 	sa->native_meta = ui_info != NULL &&
 		purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1");
-	if (sa->native_meta)
-		purple_debug_info("steam", "UI supports message-meta: inline images and emoticons, "
-		                  "message ids, read markers\n");
+	if (!sa->native_meta)
+		return;
+	sa->own_reactions = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+	                                          (GDestroyNotify) g_hash_table_destroy);
+	purple_debug_info("steam", "UI supports message-meta: inline images and emoticons, "
+	                  "message ids, read markers, scroll-back, reactions\n");
 }
 
 /*
@@ -1010,6 +1014,264 @@ steam_emit_message_meta(SteamAccount *sa, const gchar *who, GHashTable *meta)
 	g_hash_table_unref(meta);
 
 	return discard;
+}
+
+/******************************************************************************/
+/* Reactions (native_meta only) */
+/******************************************************************************/
+
+/*
+ * Steam reactions are emoticons or stickers, named. The UI gets them as
+ * text: ":name:" for an emoticon (as it is written in messages) and
+ * "sticker:Name" for a sticker. (An emoticon could be shown as
+ * <img src="<emoticon CDN>/name">, but pidgin4 shows reactions as text
+ * chips.) Senders are the friend's SteamID, or our account's username for
+ * us.
+ *
+ *   message-reaction (account, conv name, message id, emoji, sender, add)
+ *
+ * comes from FriendMessagesClient.MessageReaction and from the reactions
+ * listed on history messages. If the UI doesn't take a live one, a system
+ * line says what happened (when the conversation is open). Our own
+ * reactions are cached per message, so that send-reaction (IPC) can turn
+ * the complete new set into FriendMessages.UpdateMessageReaction adds and
+ * removes.
+ */
+
+#define STEAM_REACTION_CACHE_MAX 4096
+#define STEAM_REACTION_SET_MAX 32
+
+static gchar *
+steam_reaction_to_emoji(SteamCMReactionType type, const gchar *name)
+{
+	const gchar *p;
+
+	if (name == NULL || *name == '\0' || strlen(name) > STEAM_EMOTICON_NAME_MAX)
+		return NULL;
+	for (p = name; *p; p++) {
+		if (!steam_rich_name_char(*p))
+			return NULL;
+	}
+	if (type == STEAM_CM_REACTION_EMOTICON)
+		return g_strdup_printf(":%s:", name);
+	if (type == STEAM_CM_REACTION_STICKER)
+		return g_strdup_printf("sticker:%s", name);
+	return NULL;
+}
+
+/* The reverse of steam_reaction_to_emoji(); the name is returned (freed
+ * by the caller), or NULL when `emoji` is no Steam reaction. */
+static gchar *
+steam_reaction_from_emoji(const gchar *emoji, SteamCMReactionType *type)
+{
+	gchar *name = NULL, *check;
+	gsize len;
+
+	if (emoji == NULL)
+		return NULL;
+	len = strlen(emoji);
+	if (len > 2 && emoji[0] == ':' && emoji[len - 1] == ':') {
+		name = g_strndup(emoji + 1, len - 2);
+		*type = STEAM_CM_REACTION_EMOTICON;
+	} else if (g_str_has_prefix(emoji, "sticker:")) {
+		name = g_strdup(emoji + strlen("sticker:"));
+		*type = STEAM_CM_REACTION_STICKER;
+	} else {
+		return NULL;
+	}
+
+	// Only names that round-trip
+	check = steam_reaction_to_emoji(*type, name);
+	if (!purple_strequal(check, emoji)) {
+		g_free(name);
+		name = NULL;
+	}
+	g_free(check);
+	return name;
+}
+
+/* Our reactions to message `id` (created when `create`) */
+static GHashTable *
+steam_own_reactions(SteamAccount *sa, const gchar *id, gboolean create)
+{
+	GHashTable *set = g_hash_table_lookup(sa->own_reactions, id);
+
+	if (set == NULL && create) {
+		// A bound, not an LRU: the cache only makes diffs cheaper
+		if (g_hash_table_size(sa->own_reactions) >= STEAM_REACTION_CACHE_MAX)
+			g_hash_table_remove_all(sa->own_reactions);
+		set = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+		g_hash_table_replace(sa->own_reactions, g_strdup(id), set);
+	}
+	return set;
+}
+
+/* Records our reaction; FALSE if the cache knew it already */
+static gboolean
+steam_own_reaction_set(SteamAccount *sa, const gchar *id, const gchar *emoji, gboolean add)
+{
+	GHashTable *set = steam_own_reactions(sa, id, add);
+
+	if (add)
+		return g_hash_table_add(set, g_strdup(emoji));
+	return set != NULL && g_hash_table_remove(set, emoji);
+}
+
+static gboolean
+steam_emit_reaction(SteamAccount *sa, const gchar *who, const gchar *id, const gchar *emoji,
+		const gchar *sender, gboolean add)
+{
+	return GPOINTER_TO_INT(purple_signal_emit_return_1(purple_conversations_get_handle(),
+		"message-reaction", sa->account, who, id, emoji, sender, GINT_TO_POINTER(add)));
+}
+
+/* The reactions listed on a history message, as additions */
+static void
+steam_history_reactions(SteamAccount *sa, const gchar *who, guint64 friend_steamid,
+		const SteamCMHistoryMessage *message)
+{
+	guint32 own_accountid = steam_cm_steamid_to_accountid(sa->steamid);
+	gchar *id;
+	guint i, j;
+
+	if (message->n_reactions == 0)
+		return;
+
+	id = steam_message_id(friend_steamid, message->timestamp, message->ordinal);
+	for (i = 0; i < message->n_reactions; i++) {
+		const SteamCMHistoryReaction *r = &message->reactions[i];
+		gchar *emoji = steam_reaction_to_emoji(r->type, r->reaction);
+
+		if (emoji == NULL)
+			continue;
+		for (j = 0; j < r->n_reactors; j++) {
+			gchar sender[STEAM_ID_STR_LEN];
+
+			if (r->reactors[j] == own_accountid) {
+				steam_own_reaction_set(sa, id, emoji, TRUE);
+				steam_emit_reaction(sa, who, id, emoji, purple_account_get_username(sa->account), TRUE);
+			} else {
+				steam_id_to_str(steam_cm_accountid_to_steamid(r->reactors[j]), sender);
+				steam_emit_reaction(sa, who, id, emoji, sender, TRUE);
+			}
+		}
+		g_free(emoji);
+	}
+	g_free(id);
+}
+
+/* FriendMessagesClient.MessageReaction */
+static void
+steam_cm_reaction_cb(SteamCM *cm, const SteamCMReaction *reaction, gpointer user_data)
+{
+	SteamAccount *sa = user_data;
+	gchar who[STEAM_ID_STR_LEN], reactor[STEAM_ID_STR_LEN];
+	gboolean own = reaction->reactor == sa->steamid;
+	const gchar *sender;
+	gchar *id, *emoji;
+
+	if (!sa->native_meta)
+		return;
+	emoji = steam_reaction_to_emoji(reaction->type, reaction->reaction);
+	if (emoji == NULL) {
+		purple_debug_info("steam", "ignoring reaction of type %d\n", reaction->type);
+		return;
+	}
+
+	steam_id_to_str(reaction->steamid_friend, who);
+	id = steam_message_id(reaction->steamid_friend, reaction->server_timestamp, reaction->ordinal);
+	sender = own ? purple_account_get_username(sa->account) : steam_id_to_str(reaction->reactor, reactor);
+
+	// Our own, already reported when we sent it
+	if (own && !steam_own_reaction_set(sa, id, emoji, reaction->is_add)) {
+		g_free(id);
+		g_free(emoji);
+		return;
+	}
+
+	if (!steam_emit_reaction(sa, who, id, emoji, sender, reaction->is_add)) {
+		PurpleConversation *conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_IM, who, sa->account);
+
+		if (conv != NULL) {
+			PurpleBuddy *buddy = own ? NULL : purple_find_buddy(sa->account, who);
+			const gchar *name = own ? purple_account_get_username(sa->account)
+			                        : (buddy ? purple_buddy_get_alias(buddy) : who);
+			gchar *line = reaction->is_add
+				? g_strdup_printf(_("%s reacted %s to a message"), name, emoji)
+				: g_strdup_printf(_("%s removed the reaction %s"), name, emoji);
+			gchar *html = purple_markup_escape_text(line, -1);
+
+			purple_conversation_write(conv, "", html, PURPLE_MESSAGE_SYSTEM | PURPLE_MESSAGE_NO_LINKIFY,
+			                          time(NULL));
+			g_free(html);
+			g_free(line);
+		}
+	}
+	g_free(id);
+	g_free(emoji);
+}
+
+/* An UpdateMessageReaction in flight: undone locally if Steam refuses it */
+struct _SteamReactionUpdate {
+	SteamAccount *sa;
+	gchar *who;
+	gchar *id;
+	gchar *emoji;
+	gboolean add;
+};
+
+static void
+steam_reaction_update_free(SteamReactionUpdate *update)
+{
+	g_free(update->who);
+	g_free(update->id);
+	g_free(update->emoji);
+	g_free(update);
+}
+
+static void
+steam_reaction_update_cb(SteamCM *cm, SteamEResult eresult, gpointer user_data)
+{
+	SteamReactionUpdate *update = user_data;
+	SteamAccount *sa = update->sa;
+
+	sa->reaction_updates = g_slist_remove(sa->reaction_updates, update);
+	if (eresult != STEAM_ERESULT_OK) {
+		purple_debug_warning("steam", "%s the reaction %s failed: %s\n",
+		                     update->add ? "adding" : "removing", update->emoji,
+		                     steam_eresult_to_string(eresult));
+		// Undo it in the cache and in the UI
+		steam_own_reaction_set(sa, update->id, update->emoji, !update->add);
+		steam_emit_reaction(sa, update->who, update->id, update->emoji,
+		                    purple_account_get_username(sa->account), !update->add);
+	}
+	steam_reaction_update_free(update);
+}
+
+static void
+steam_send_reaction(SteamAccount *sa, const gchar *who, const gchar *id, guint64 friend_steamid,
+		guint32 timestamp, guint32 ordinal, const gchar *emoji, gboolean add)
+{
+	SteamCMReactionType type = STEAM_CM_REACTION_INVALID;
+	gchar *name = steam_reaction_from_emoji(emoji, &type);
+	SteamReactionUpdate *update;
+
+	if (name == NULL)
+		return;
+
+	update = g_new0(SteamReactionUpdate, 1);
+	update->sa = sa;
+	update->who = g_strdup(who);
+	update->id = g_strdup(id);
+	update->emoji = g_strdup(emoji);
+	update->add = add;
+	sa->reaction_updates = g_slist_prepend(sa->reaction_updates, update);
+
+	steam_own_reaction_set(sa, id, emoji, add);
+	steam_cm_update_message_reaction(sa->cm, friend_steamid, timestamp, ordinal, type, name, add,
+	                                 steam_reaction_update_cb, update);
+	steam_emit_reaction(sa, who, id, emoji, purple_account_get_username(sa->account), add);
+	g_free(name);
 }
 
 /* Remembers the first live message shown for `who` since the last logon,
@@ -1546,6 +1808,8 @@ steam_got_history_cb(SteamCM *cm, guint64 friend_steamid,
 			serv_got_im(sa->pc, who, html, PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_DELAYED, message->timestamp);
 		}
 		g_free(html);
+		if (sa->native_meta)
+			steam_history_reactions(sa, who, friend_steamid, message);
 
 		newest = MAX(newest, message->timestamp);
 	}
@@ -2247,6 +2511,7 @@ static const SteamCMCallbacks steam_cm_callbacks = {
 	steam_cm_nicknames_cb,
 	steam_cm_add_friend_response_cb,
 	steam_cm_ack_echo_cb,
+	steam_cm_reaction_cb,
 };
 
 /******************************************************************************/
@@ -2758,6 +3023,15 @@ static void steam_close(PurpleConnection *pc)
 			purple_account_request_close(req->ui_handle);
 		steam_friend_request_free(req);
 	}
+
+	while (sa->reaction_updates != NULL) {
+		// steam_cm_free() dropped their callbacks
+		SteamReactionUpdate *update = sa->reaction_updates->data;
+		sa->reaction_updates = g_slist_remove(sa->reaction_updates, update);
+		steam_reaction_update_free(update);
+	}
+	if (sa->own_reactions != NULL)
+		g_hash_table_destroy(sa->own_reactions);
 
 	while (sa->older_fetches != NULL) {
 		// steam_cm_free() dropped their callbacks
@@ -3425,17 +3699,18 @@ steam_got_older_cb(SteamCM *cm, guint64 friend_steamid, const SteamCMHistoryMess
 		if (i == 1)
 			last_id = steam_message_id(friend_steamid, message->timestamp, message->ordinal);
 
-		if (steam_emit_message_meta(sa, fetch->who,
-				steam_message_meta_new(sa, fetch->who, message->timestamp, message->ordinal, own, "older")))
-			continue;   // the UI has it (and shows it from its own store)
-
-		html = steam_rich_to_html(message->message, TRUE, NULL);
-		if (own)
-			steam_write_sent_message(sa, fetch->who, html, PURPLE_MESSAGE_DELAYED, message->timestamp);
-		else
-			serv_got_im(sa->pc, fetch->who, html, PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_DELAYED,
-			            message->timestamp);
-		g_free(html);
+		if (!steam_emit_message_meta(sa, fetch->who,
+				steam_message_meta_new(sa, fetch->who, message->timestamp, message->ordinal, own, "older"))) {
+			html = steam_rich_to_html(message->message, TRUE, NULL);
+			if (own)
+				steam_write_sent_message(sa, fetch->who, html, PURPLE_MESSAGE_DELAYED, message->timestamp);
+			else
+				serv_got_im(sa->pc, fetch->who, html, PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_DELAYED,
+				            message->timestamp);
+			g_free(html);
+		}
+		// Also for a message the UI has (it shows it from its own store)
+		steam_history_reactions(sa, fetch->who, friend_steamid, message);
 	}
 
 	if (steam_signals_registered)
@@ -3458,6 +3733,8 @@ steam_got_older_cb(SteamCM *cm, guint64 friend_steamid, const SteamCMHistoryMess
  *
  *   gboolean send-marker     (PurpleAccount *, const char *conv_name,
  *                             const char *message_id, const char *marker)
+ *   gboolean send-reaction   (PurpleAccount *, const char *conv_name,
+ *                             const char *target_id, const char *emoji_list)
  *   gboolean mam-fetch-older (PurpleAccount *, const char *conv_name,
  *                             const char *before_id, guint count)
  *
@@ -3473,6 +3750,12 @@ steam_ui_has_message_meta(void)
 	GHashTable *ui_info = purple_core_get_ui_info();
 
 	return ui_info != NULL && purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1");
+}
+
+static gint
+steam_strptr_cmp(gconstpointer a, gconstpointer b)
+{
+	return strcmp(*(const gchar * const *) a, *(const gchar * const *) b);
 }
 
 static SteamAccount *
@@ -3522,6 +3805,85 @@ steam_ipc_send_marker(PurpleAccount *account, const gchar *conv_name, const gcha
 		return FALSE;
 
 	steam_cm_ack_message(sa->cm, friend_steamid, timestamp);
+	return TRUE;
+}
+
+/* Our reactions to `target_id` become exactly `emoji_list` (space
+ * separated; "" removes all): the difference goes to Steam as
+ * UpdateMessageReaction removes, then adds, and is reported to the UI as
+ * message-reaction at once. FALSE if an entry isn't a Steam reaction
+ * (":emoticon:" or "sticker:Name"); then nothing is sent. */
+static gboolean
+steam_ipc_send_reaction(PurpleAccount *account, const gchar *conv_name, const gchar *target_id,
+		const gchar *emoji_list)
+{
+	SteamAccount *sa = steam_ipc_account(account);
+	guint64 friend_steamid;
+	guint32 timestamp, ordinal;
+	GHashTable *wanted, *current;
+	GPtrArray *add, *remove;
+	gchar **tokens, **t, *id, *valid;
+	gchar who[STEAM_ID_STR_LEN];
+	GHashTableIter it;
+	gpointer key;
+	gboolean ok = TRUE;
+	guint i;
+
+	if (sa == NULL || !steam_ipc_message(conv_name, target_id, &friend_steamid, &timestamp, &ordinal))
+		return FALSE;
+
+	wanted = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	tokens = g_strsplit_set(emoji_list ? emoji_list : "", " \t\n", -1);
+	for (t = tokens; *t; t++) {
+		SteamCMReactionType type;
+
+		if (**t == '\0')
+			continue;
+		if ((valid = steam_reaction_from_emoji(*t, &type)) == NULL ||
+		    g_hash_table_size(wanted) >= STEAM_REACTION_SET_MAX) {
+			g_free(valid);
+			ok = FALSE;
+			break;
+		}
+		g_free(valid);
+		g_hash_table_add(wanted, g_strdup(*t));
+	}
+	g_strfreev(tokens);
+	if (!ok) {
+		g_hash_table_destroy(wanted);
+		return FALSE;
+	}
+
+	steam_id_to_str(friend_steamid, who);
+	id = steam_message_id(friend_steamid, timestamp, ordinal);
+	current = steam_own_reactions(sa, id, FALSE);
+	add = g_ptr_array_new_with_free_func(g_free);
+	remove = g_ptr_array_new_with_free_func(g_free);
+	if (current != NULL) {
+		g_hash_table_iter_init(&it, current);
+		while (g_hash_table_iter_next(&it, &key, NULL)) {
+			if (!g_hash_table_contains(wanted, key))
+				g_ptr_array_add(remove, g_strdup(key));
+		}
+	}
+	g_hash_table_iter_init(&it, wanted);
+	while (g_hash_table_iter_next(&it, &key, NULL)) {
+		if (current == NULL || !g_hash_table_contains(current, key))
+			g_ptr_array_add(add, g_strdup(key));
+	}
+	// A stable order on the wire
+	g_ptr_array_sort(remove, (GCompareFunc) steam_strptr_cmp);
+	g_ptr_array_sort(add, (GCompareFunc) steam_strptr_cmp);
+
+	for (i = 0; i < remove->len; i++)
+		steam_send_reaction(sa, who, id, friend_steamid, timestamp, ordinal, g_ptr_array_index(remove, i), FALSE);
+	for (i = 0; i < add->len; i++)
+		steam_send_reaction(sa, who, id, friend_steamid, timestamp, ordinal, g_ptr_array_index(add, i), TRUE);
+
+	g_ptr_array_free(add, TRUE);
+	g_ptr_array_free(remove, TRUE);
+	g_hash_table_destroy(wanted);
+	g_free(id);
 	return TRUE;
 }
 
@@ -3585,6 +3947,15 @@ steam_ipc_register(PurplePlugin *plugin)
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_STRING));
 
+	purple_plugin_ipc_register(plugin, "send-reaction",
+			PURPLE_CALLBACK(steam_ipc_send_reaction),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
 	purple_plugin_ipc_register(plugin, "mam-fetch-older",
 			PURPLE_CALLBACK(steam_ipc_mam_fetch_older),
 			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_UINT,
@@ -3605,8 +3976,8 @@ steam_ipc_register(PurplePlugin *plugin)
 			purple_value_new(PURPLE_TYPE_BOOLEAN));
 	steam_signals_registered = TRUE;
 
-	purple_debug_info("steam", "UI has message-meta: registered IPC commands send-marker and "
-	                  "mam-fetch-older, and the signal mam-query-done\n");
+	purple_debug_info("steam", "UI has message-meta: registered IPC commands send-marker, "
+	                  "send-reaction and mam-fetch-older, and the signal mam-query-done\n");
 }
 
 /******************************************************************************/

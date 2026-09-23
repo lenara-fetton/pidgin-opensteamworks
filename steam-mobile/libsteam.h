@@ -99,6 +99,7 @@
 
 typedef struct _SteamAccount SteamAccount;
 typedef struct _SteamOlderFetch SteamOlderFetch;
+typedef struct _SteamReactionUpdate SteamReactionUpdate;
 typedef struct _SteamBuddy SteamBuddy;
 struct _SteamAuth;   /* steam_auth.h */
 struct _SteamCM;     /* steam_cm.h */
@@ -157,6 +158,8 @@ struct _SteamAccount {
 	 * is unchanged. */
 	gboolean native_meta;
 	GSList *older_fetches;         /* SteamOlderFetch: scroll-back pages in flight */
+	GHashTable *own_reactions;     /* message id -> GHashTable set of our reactions (display form) */
+	GSList *reaction_updates;      /* SteamReactionUpdate: UpdateMessageReaction in flight */
 };
 
 struct _SteamBuddy {

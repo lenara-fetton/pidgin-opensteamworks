@@ -170,6 +170,8 @@ const char *steam_emsg_to_string(guint32 emsg);
 #define STEAM_NOTIFY_FRIEND_MESSAGES_INCOMING_MESSAGE    "FriendMessagesClient.IncomingMessage#1"
 #define STEAM_METHOD_FRIEND_MESSAGES_ACK_MESSAGE         "FriendMessages.AckMessage#1"
 #define STEAM_NOTIFY_FRIEND_MESSAGES_ACK_ECHO            "FriendMessagesClient.NotifyAckMessageEcho#1"
+#define STEAM_METHOD_FRIEND_MESSAGES_UPDATE_REACTION     "FriendMessages.UpdateMessageReaction#1"
+#define STEAM_NOTIFY_FRIEND_MESSAGES_MESSAGE_REACTION    "FriendMessagesClient.MessageReaction#1"
 
 /* ======================================================================
  * Base (steammessages_base.proto)
@@ -699,8 +701,24 @@ typedef struct {
 	gchar *message;          /* 3 string */
 	gboolean has_ordinal;    /* 4 uint32 */
 	guint32 ordinal;
-	/* 5 repeated MessageReaction reactions: not modelled (skipped) */
+	GArray *reactions;       /* 5 repeated SteamMsgFriendMessageReaction; NULL when none */
 } SteamMsgFriendMessage;
+
+/* EMessageReactionType */
+#define STEAM_REACTION_TYPE_INVALID  0
+#define STEAM_REACTION_TYPE_EMOTICON 1
+#define STEAM_REACTION_TYPE_STICKER  2
+
+/* CFriendMessages_GetRecentMessages_Response.FriendMessage.MessageReaction */
+typedef struct {
+	gboolean has_reaction_type;  /* 1 enum EMessageReactionType */
+	gint32 reaction_type;
+	gchar *reaction;             /* 2 string: the emoticon or sticker name */
+	GArray *reactors;            /* 3 repeated uint32 account ids (never NULL in a decoded reaction) */
+} SteamMsgFriendMessageReaction;
+
+/* Appends an empty reaction to `fm` (for encoding) and returns it. */
+SteamMsgFriendMessageReaction *steam_msg_friend_message_add_reaction(SteamMsgFriendMessage *fm);
 
 /* CFriendMessages_GetRecentMessages_Response */
 typedef struct {
@@ -768,6 +786,59 @@ void steam_msg_friend_messages_ack_message_init(SteamMsgFriendMessagesAckMessage
 void steam_msg_friend_messages_ack_message_clear(SteamMsgFriendMessagesAckMessage *m);
 void steam_msg_friend_messages_ack_message_encode(const SteamMsgFriendMessagesAckMessage *m, GByteArray *out);
 gboolean steam_msg_friend_messages_ack_message_decode(SteamMsgFriendMessagesAckMessage *m, const guint8 *data, gsize len);
+
+/* CFriendMessages_UpdateMessageReaction_Request (FriendMessages.UpdateMessageReaction#1) */
+typedef struct {
+	gboolean has_steamid;          /* 1 fixed64: the friend */
+	guint64 steamid;
+	gboolean has_server_timestamp; /* 2 uint32: the message's timestamp */
+	guint32 server_timestamp;
+	gboolean has_ordinal;          /* 3 uint32: the message's ordinal */
+	guint32 ordinal;
+	gboolean has_reaction_type;    /* 4 enum EMessageReactionType */
+	gint32 reaction_type;
+	gchar *reaction;               /* 5 string: emoticon or sticker name */
+	gboolean has_is_add;           /* 6 bool */
+	gboolean is_add;
+} SteamMsgFriendMessagesUpdateMessageReactionRequest;
+
+void steam_msg_friend_messages_update_message_reaction_request_init(SteamMsgFriendMessagesUpdateMessageReactionRequest *m);
+void steam_msg_friend_messages_update_message_reaction_request_clear(SteamMsgFriendMessagesUpdateMessageReactionRequest *m);
+void steam_msg_friend_messages_update_message_reaction_request_encode(const SteamMsgFriendMessagesUpdateMessageReactionRequest *m, GByteArray *out);
+gboolean steam_msg_friend_messages_update_message_reaction_request_decode(SteamMsgFriendMessagesUpdateMessageReactionRequest *m, const guint8 *data, gsize len);
+
+/* CFriendMessages_UpdateMessageReaction_Response */
+typedef struct {
+	GArray *reactors;              /* 1 repeated uint32 account ids */
+} SteamMsgFriendMessagesUpdateMessageReactionResponse;
+
+void steam_msg_friend_messages_update_message_reaction_response_init(SteamMsgFriendMessagesUpdateMessageReactionResponse *m);
+void steam_msg_friend_messages_update_message_reaction_response_clear(SteamMsgFriendMessagesUpdateMessageReactionResponse *m);
+void steam_msg_friend_messages_update_message_reaction_response_encode(const SteamMsgFriendMessagesUpdateMessageReactionResponse *m, GByteArray *out);
+gboolean steam_msg_friend_messages_update_message_reaction_response_decode(SteamMsgFriendMessagesUpdateMessageReactionResponse *m, const guint8 *data, gsize len);
+
+/* CFriendMessages_MessageReaction_Notification
+ * (FriendMessagesClient.MessageReaction#1) */
+typedef struct {
+	gboolean has_steamid_friend;   /* 1 fixed64: the conversation's friend */
+	guint64 steamid_friend;
+	gboolean has_server_timestamp; /* 2 uint32: the reacted-to message */
+	guint32 server_timestamp;
+	gboolean has_ordinal;          /* 3 uint32 */
+	guint32 ordinal;
+	gboolean has_reactor;          /* 4 fixed64: who reacted */
+	guint64 reactor;
+	gboolean has_reaction_type;    /* 5 enum EMessageReactionType */
+	gint32 reaction_type;
+	gchar *reaction;               /* 6 string */
+	gboolean has_is_add;           /* 7 bool */
+	gboolean is_add;
+} SteamMsgFriendMessagesMessageReaction;
+
+void steam_msg_friend_messages_message_reaction_init(SteamMsgFriendMessagesMessageReaction *m);
+void steam_msg_friend_messages_message_reaction_clear(SteamMsgFriendMessagesMessageReaction *m);
+void steam_msg_friend_messages_message_reaction_encode(const SteamMsgFriendMessagesMessageReaction *m, GByteArray *out);
+gboolean steam_msg_friend_messages_message_reaction_decode(SteamMsgFriendMessagesMessageReaction *m, const guint8 *data, gsize len);
 
 /* ======================================================================
  * Player service (steammessages_player.steamclient.proto)

@@ -320,6 +320,28 @@ nothing new runs, and the output is exactly what it was.
   (`GetActiveMessageSessions` + `GetRecentMessages` since the last message
   seen) is unchanged apart from `mam-query` = `catchup` and BBCode.
 
+- **Reactions.** Steam reactions are named emoticons (`reaction_type` 1)
+  or stickers (2). The UI gets them as text, `:name:` or `sticker:Name`
+  (pidgin4 shows reactions as text chips; an emoticon could also be drawn
+  as `<img src="…/economy/emoticon/name">`), with the friend's SteamID or
+  our username as the sender. `FriendMessagesClient.MessageReaction#1`
+  (`CFriendMessages_MessageReaction_Notification { fixed64 steamid_friend =
+  1; uint32 server_timestamp = 2; uint32 ordinal = 3; fixed64 reactor = 4;
+  EMessageReactionType reaction_type = 5; string reaction = 6; bool is_add =
+  7; }`) becomes `message-reaction(account, friend, id, emoji, sender,
+  add)`, and a system line in the open conversation if the UI doesn't take
+  it. The reactions listed on history messages (`FriendMessage.reactions =
+  5 { reaction_type = 1; reaction = 2; repeated uint32 reactors = 3; }`)
+  are emitted as additions. Our own reactions are cached per message; IPC
+  `send-reaction(account, conv name, target id, emoji list)` diffs the
+  complete new set (space separated, `""` for none) against the cache and
+  sends `FriendMessages.UpdateMessageReaction#1` (`{ fixed64 steamid = 1;
+  uint32 server_timestamp = 2; uint32 ordinal = 3; reaction_type = 4;
+  string reaction = 5; bool is_add = 6; }`) removes, then adds, reporting
+  each as `message-reaction` at once; one Steam refuses is reported undone.
+  It returns FALSE, sending nothing, if an entry isn't a Steam reaction
+  (e.g. a Unicode emoji).
+
 ## Testing without a Steam account
 
 - `tests/test_proto.c`: round-trips for `steam_proto` and `steam_msgs`;

@@ -1017,6 +1017,37 @@ cm_handle_ack_echo(SteamCM *cm, const guint8 *body, gsize len)
 }
 
 static void
+cm_handle_message_reaction(SteamCM *cm, const guint8 *body, gsize len)
+{
+	SteamMsgFriendMessagesMessageReaction m;
+	SteamCMReaction reaction;
+
+	steam_msg_friend_messages_message_reaction_init(&m);
+	if (!steam_msg_friend_messages_message_reaction_decode(&m, body, len) ||
+	    !m.has_steamid_friend || !m.has_server_timestamp || !m.has_reactor ||
+	    m.reaction == NULL || *m.reaction == '\0') {
+		purple_debug_warning("steam", "CM: malformed MessageReaction\n");
+		steam_msg_friend_messages_message_reaction_clear(&m);
+		return;
+	}
+
+	memset(&reaction, 0, sizeof(reaction));
+	reaction.steamid_friend = m.steamid_friend;
+	reaction.server_timestamp = m.server_timestamp;
+	reaction.ordinal = m.ordinal;
+	reaction.reactor = m.reactor;
+	reaction.type = (SteamCMReactionType) m.reaction_type;
+	reaction.reaction = m.reaction;
+	reaction.is_add = m.is_add;
+	purple_debug_misc("steam", "CM: reaction %s %s by %" G_GUINT64_FORMAT "\n",
+	                  m.is_add ? "added" : "removed", m.reaction, m.reactor);
+
+	if (CM_ALIVE(cm) && cm->cb.reaction)
+		cm->cb.reaction(cm, &reaction, cm->user_data);
+	steam_msg_friend_messages_message_reaction_clear(&m);
+}
+
+static void
 cm_handle_service_method(SteamCM *cm, const SteamMsgProtoBufHeader *hdr,
                          const guint8 *body, gsize len)
 {
@@ -1026,6 +1057,8 @@ cm_handle_service_method(SteamCM *cm, const SteamMsgProtoBufHeader *hdr,
 		cm_handle_incoming_message(cm, body, len);
 	else if (name != NULL && strcmp(name, STEAM_NOTIFY_FRIEND_MESSAGES_ACK_ECHO) == 0)
 		cm_handle_ack_echo(cm, body, len);
+	else if (name != NULL && strcmp(name, STEAM_NOTIFY_FRIEND_MESSAGES_MESSAGE_REACTION) == 0)
+		cm_handle_message_reaction(cm, body, len);
 	else
 		purple_debug_misc("steam", "CM: ignoring notification %s\n", name ? name : "(unnamed)");
 }
@@ -1696,6 +1729,47 @@ steam_cm_ack_message(SteamCM *cm, guint64 steamid_partner, guint32 timestamp)
 	steam_msg_friend_messages_ack_message_clear(&m);
 }
 
+/* --- FriendMessages.UpdateMessageReaction --- */
+
+static void
+cm_update_reaction_done(SteamCM *cm, CMJob *job, SteamEResult eresult,
+                        const guint8 *body, gsize len)
+{
+	SteamCMReactionDoneFunc callback = (SteamCMReactionDoneFunc) job->callback;
+
+	if (callback)
+		callback(cm, body != NULL ? eresult : (eresult == STEAM_ERESULT_OK ? STEAM_ERESULT_FAIL : eresult),
+		         job->user_data);
+}
+
+void
+steam_cm_update_message_reaction(SteamCM *cm, guint64 steamid, guint32 server_timestamp,
+                                 guint32 ordinal, SteamCMReactionType type,
+                                 const gchar *reaction, gboolean is_add,
+                                 SteamCMReactionDoneFunc callback, gpointer user_data)
+{
+	SteamMsgFriendMessagesUpdateMessageReactionRequest m;
+	GByteArray *body;
+
+	if (!cm_check_logged_on(cm, "update_message_reaction"))
+		return;
+
+	steam_msg_friend_messages_update_message_reaction_request_init(&m);
+	STEAM_MSG_SET(&m, steamid, steamid);
+	STEAM_MSG_SET(&m, server_timestamp, server_timestamp);
+	if (ordinal)
+		STEAM_MSG_SET(&m, ordinal, ordinal);
+	STEAM_MSG_SET(&m, reaction_type, (gint32) type);
+	m.reaction = g_strdup(reaction);
+	STEAM_MSG_SET(&m, is_add, is_add);
+	body = g_byte_array_new();
+	steam_msg_friend_messages_update_message_reaction_request_encode(&m, body);
+	cm_call_service(cm, STEAM_METHOD_FRIEND_MESSAGES_UPDATE_REACTION, body,
+	                callback ? cm_update_reaction_done : NULL, (gpointer) callback, user_data, steamid);
+	g_byte_array_unref(body);
+	steam_msg_friend_messages_update_message_reaction_request_clear(&m);
+}
+
 /* --- FriendMessages.GetRecentMessages --- */
 
 static void
@@ -1705,8 +1779,9 @@ cm_recent_messages_done(SteamCM *cm, CMJob *job, SteamEResult eresult,
 	SteamCMHistoryFunc callback = (SteamCMHistoryFunc) job->callback;
 	SteamMsgFriendMessagesGetRecentMessagesResponse resp;
 	SteamCMHistoryMessage *msgs = NULL;
+	GPtrArray *reactions = g_ptr_array_new_with_free_func(g_free);
 	gboolean more = FALSE;
-	guint i, n = 0;
+	guint i, j, n = 0;
 
 	steam_msg_friend_messages_get_recent_messages_response_init(&resp);
 	if (body != NULL && eresult == STEAM_ERESULT_OK &&
@@ -1720,10 +1795,27 @@ cm_recent_messages_done(SteamCM *cm, CMJob *job, SteamEResult eresult,
 			msgs[i].timestamp = src->timestamp;
 			msgs[i].message = src->message;
 			msgs[i].ordinal = src->ordinal;
+			if (src->reactions != NULL && src->reactions->len > 0) {
+				SteamCMHistoryReaction *r = g_new0(SteamCMHistoryReaction, src->reactions->len);
+
+				for (j = 0; j < src->reactions->len; j++) {
+					const SteamMsgFriendMessageReaction *mr =
+						&g_array_index(src->reactions, SteamMsgFriendMessageReaction, j);
+
+					r[j].type = (SteamCMReactionType) mr->reaction_type;
+					r[j].reaction = mr->reaction ? mr->reaction : "";
+					r[j].reactors = (const guint32 *) mr->reactors->data;
+					r[j].n_reactors = mr->reactors->len;
+				}
+				msgs[i].reactions = r;
+				msgs[i].n_reactions = src->reactions->len;
+				g_ptr_array_add(reactions, r);
+			}
 		}
 	}
 	if (callback)
 		callback(cm, job->friend_steamid, msgs, n, more, job->user_data);
+	g_ptr_array_free(reactions, TRUE);
 	g_free(msgs);
 	steam_msg_friend_messages_get_recent_messages_response_clear(&resp);
 }

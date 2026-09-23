@@ -133,12 +133,42 @@ typedef struct {
 	guint32 ordinal;           /* tells apart messages with the same timestamp */
 } SteamCMMessage;
 
+/* EMessageReactionType */
+typedef enum {
+	STEAM_CM_REACTION_INVALID = 0,
+	STEAM_CM_REACTION_EMOTICON = 1,
+	STEAM_CM_REACTION_STICKER = 2
+} SteamCMReactionType;
+
+/* A reaction on a history message: everyone who reacted with it */
+typedef struct {
+	SteamCMReactionType type;
+	const gchar *reaction;     /* emoticon or sticker name */
+	const guint32 *reactors;   /* account ids */
+	guint n_reactors;
+} SteamCMHistoryReaction;
+
 typedef struct {
 	guint32 accountid;         /* low 32 bits of the sender's SteamID */
 	guint32 timestamp;
 	gchar *message;
 	guint32 ordinal;
+	const SteamCMHistoryReaction *reactions;
+	guint n_reactions;
 } SteamCMHistoryMessage;
+
+/* FriendMessagesClient.MessageReaction: someone (possibly us, on another
+ * session) added or removed a reaction to the message (timestamp, ordinal)
+ * of the conversation with steamid_friend. */
+typedef struct {
+	guint64 steamid_friend;
+	guint32 server_timestamp;
+	guint32 ordinal;
+	guint64 reactor;
+	SteamCMReactionType type;
+	const gchar *reaction;
+	gboolean is_add;
+} SteamCMReaction;
 
 typedef struct {
 	guint32 accountid_friend;
@@ -198,6 +228,9 @@ typedef struct {
 	 * read the conversation with `steamid_partner` up to `timestamp`. */
 	void (*ack_echo)(SteamCM *cm, guint64 steamid_partner, guint32 timestamp,
 	                 gpointer user_data);
+
+	/* FriendMessagesClient.MessageReaction */
+	void (*reaction)(SteamCM *cm, const SteamCMReaction *reaction, gpointer user_data);
 } SteamCMCallbacks;
 
 SteamCM *steam_cm_new(SteamAccount *sa, const SteamCMCallbacks *callbacks,
@@ -254,6 +287,15 @@ void steam_cm_send_message_full(SteamCM *cm, guint64 steamid, SteamChatEntryType
 /* FriendMessages.AckMessage: we have read the conversation with
  * `steamid_partner` up to the message at `timestamp`. No reply. */
 void steam_cm_ack_message(SteamCM *cm, guint64 steamid_partner, guint32 timestamp);
+
+/* FriendMessages.UpdateMessageReaction: adds or removes our reaction to the
+ * message (server_timestamp, ordinal) of the conversation with `steamid`.
+ * `callback` (may be NULL) gets the result. */
+typedef void (*SteamCMReactionDoneFunc)(SteamCM *cm, SteamEResult eresult, gpointer user_data);
+void steam_cm_update_message_reaction(SteamCM *cm, guint64 steamid, guint32 server_timestamp,
+                                      guint32 ordinal, SteamCMReactionType type,
+                                      const gchar *reaction, gboolean is_add,
+                                      SteamCMReactionDoneFunc callback, gpointer user_data);
 
 /* FriendMessages.GetRecentMessages for one conversation, newest first as
  * returned by Steam. `since` is a unix time (0 for none). */
