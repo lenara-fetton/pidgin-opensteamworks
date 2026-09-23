@@ -98,6 +98,7 @@
 #define STEAM_PLUGIN_VERSION "2.0"
 
 typedef struct _SteamAccount SteamAccount;
+typedef struct _SteamOlderFetch SteamOlderFetch;
 typedef struct _SteamBuddy SteamBuddy;
 struct _SteamAuth;   /* steam_auth.h */
 struct _SteamCM;     /* steam_cm.h */
@@ -155,6 +156,7 @@ struct _SteamAccount {
 	 * stock one checks this; on stock Pidgin it is FALSE and the output
 	 * is unchanged. */
 	gboolean native_meta;
+	GSList *older_fetches;         /* SteamOlderFetch: scroll-back pages in flight */
 };
 
 struct _SteamBuddy {

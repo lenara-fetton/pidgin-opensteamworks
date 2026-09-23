@@ -30,6 +30,9 @@
 #include "steam_eresult.h"
 
 static gboolean core_is_haze = FALSE;
+static PurplePlugin *steam_plugin = NULL;   /* this prpl, for its signals */
+static gboolean steam_signals_registered = FALSE;
+static void steam_older_fetch_free(SteamOlderFetch *fetch);
 
 // Hack to fix OSX compatibility :)
 #ifdef __APPLE__
@@ -2756,6 +2759,13 @@ static void steam_close(PurpleConnection *pc)
 		steam_friend_request_free(req);
 	}
 
+	while (sa->older_fetches != NULL) {
+		// steam_cm_free() dropped their callbacks
+		SteamOlderFetch *fetch = sa->older_fetches->data;
+		sa->older_fetches = g_slist_remove(sa->older_fetches, fetch);
+		steam_older_fetch_free(fetch);
+	}
+
 	while (sa->pending_sends != NULL) {
 		// steam_cm_free() dropped their callbacks
 		SteamSendContext *ctx = sa->pending_sends->data;
@@ -3323,6 +3333,122 @@ steam_node_menu(PurpleBlistNode *node)
 }
 
 /******************************************************************************/
+/* Scroll-back history (native_meta only) */
+/******************************************************************************/
+
+/*
+ * The IPC command mam-fetch-older (below) reads one page of the
+ * conversation's history before a message with
+ * FriendMessages.GetRecentMessages#1: time_last/ordinal_last are the
+ * message's timestamp and ordinal (the newest page when there is none),
+ * bbcode_format is set, and messages come back newest first. The page is
+ * shown oldest first through the normal path, with PURPLE_MESSAGE_DELAYED
+ * and mam = "1", mam-query = "older" in the metadata. Then the plugin's
+ * signal
+ *
+ *   mam-query-done (account, conv name, first id, last id, gboolean complete)
+ *
+ * reports the oldest and newest id of the page (the first is the next
+ * page's before id) and whether the history has no more.
+ */
+
+#define STEAM_OLDER_MAX 100   /* what GetRecentMessages returns at most */
+
+struct _SteamOlderFetch {
+	SteamAccount *sa;
+	gchar *who;
+	guint count;
+	gboolean has_before;
+	guint32 before_timestamp;
+	guint32 before_ordinal;
+};
+
+static void
+steam_older_fetch_free(SteamOlderFetch *fetch)
+{
+	g_free(fetch->who);
+	g_free(fetch);
+}
+
+/* Is the message (timestamp, ordinal) older than the fetch's before id? */
+static gboolean
+steam_older_is_before(const SteamOlderFetch *fetch, guint32 timestamp, guint32 ordinal)
+{
+	if (!fetch->has_before)
+		return TRUE;
+	return timestamp < fetch->before_timestamp ||
+	       (timestamp == fetch->before_timestamp && ordinal < fetch->before_ordinal);
+}
+
+static void
+steam_got_older_cb(SteamCM *cm, guint64 friend_steamid, const SteamCMHistoryMessage *messages,
+		guint n, gboolean more_available, gpointer user_data)
+{
+	SteamOlderFetch *fetch = user_data;
+	SteamAccount *sa = fetch->sa;
+	guint32 own_accountid = steam_cm_steamid_to_accountid(sa->steamid);
+	GPtrArray *page = g_ptr_array_new();
+	gchar *first_id = NULL, *last_id = NULL;
+	gboolean more = more_available;
+	guint i;
+
+	sa->older_fetches = g_slist_remove(sa->older_fetches, fetch);
+
+	if (messages == NULL) {
+		// The request failed: no answer, so the UI gives up on its own
+		// and can ask again
+		purple_debug_warning("steam", "fetching older messages with %s failed\n", fetch->who);
+		g_ptr_array_free(page, TRUE);
+		steam_older_fetch_free(fetch);
+		return;
+	}
+
+	// Newest first: take the `count` newest before the before id
+	for (i = 0; i < n; i++) {
+		if (!steam_older_is_before(fetch, messages[i].timestamp, messages[i].ordinal))
+			continue;
+		if (page->len == fetch->count) {
+			more = TRUE;
+			break;
+		}
+		g_ptr_array_add(page, (gpointer) &messages[i]);
+	}
+
+	// Shown oldest first
+	for (i = page->len; i > 0; i--) {
+		const SteamCMHistoryMessage *message = g_ptr_array_index(page, i - 1);
+		gboolean own = message->accountid == own_accountid;
+		gchar *html;
+
+		if (first_id == NULL)
+			first_id = steam_message_id(friend_steamid, message->timestamp, message->ordinal);
+		if (i == 1)
+			last_id = steam_message_id(friend_steamid, message->timestamp, message->ordinal);
+
+		if (steam_emit_message_meta(sa, fetch->who,
+				steam_message_meta_new(sa, fetch->who, message->timestamp, message->ordinal, own, "older")))
+			continue;   // the UI has it (and shows it from its own store)
+
+		html = steam_rich_to_html(message->message, TRUE, NULL);
+		if (own)
+			steam_write_sent_message(sa, fetch->who, html, PURPLE_MESSAGE_DELAYED, message->timestamp);
+		else
+			serv_got_im(sa->pc, fetch->who, html, PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_DELAYED,
+			            message->timestamp);
+		g_free(html);
+	}
+
+	if (steam_signals_registered)
+		purple_signal_emit(steam_plugin, "mam-query-done", sa->account, fetch->who,
+		                   first_id, last_id, (guint) !more);
+
+	g_free(first_id);
+	g_free(last_id);
+	g_ptr_array_free(page, TRUE);
+	steam_older_fetch_free(fetch);
+}
+
+/******************************************************************************/
 /* IPC for message-meta UIs */
 /******************************************************************************/
 
@@ -3330,8 +3456,12 @@ steam_node_menu(PurpleBlistNode *node)
  * Registered on the plugin when the UI has message-meta (see
  * steam_native_init()), with the signatures of the XMPP prpl's (M8):
  *
- *   gboolean send-marker (PurpleAccount *, const char *conv_name,
- *                         const char *message_id, const char *marker)
+ *   gboolean send-marker     (PurpleAccount *, const char *conv_name,
+ *                             const char *message_id, const char *marker)
+ *   gboolean mam-fetch-older (PurpleAccount *, const char *conv_name,
+ *                             const char *before_id, guint count)
+ *
+ * and the signal mam-query-done (see "Scroll-back history").
  *
  * They return FALSE unless the account is a connected Steam account on a
  * message-meta UI and the arguments name a Steam message.
@@ -3395,6 +3525,51 @@ steam_ipc_send_marker(PurpleAccount *account, const gchar *conv_name, const gcha
 	return TRUE;
 }
 
+/* One page of up to `count` (1-100) messages before `before_id` (NULL or
+ * "": the newest page); see "Scroll-back history" above. */
+static gboolean
+steam_ipc_mam_fetch_older(PurpleAccount *account, const gchar *conv_name, const gchar *before_id,
+		guint count)
+{
+	SteamAccount *sa = steam_ipc_account(account);
+	guint64 friend_steamid = steam_str_to_id(conv_name);
+	SteamCMHistoryQuery query;
+	SteamOlderFetch *fetch;
+	gchar who[STEAM_ID_STR_LEN];
+
+	if (sa == NULL || friend_steamid == 0)
+		return FALSE;
+
+	fetch = g_new0(SteamOlderFetch, 1);
+	fetch->sa = sa;
+	fetch->who = g_strdup(steam_id_to_str(friend_steamid, who));
+	fetch->count = CLAMP(count, 1, STEAM_OLDER_MAX);
+
+	memset(&query, 0, sizeof(query));
+	query.bbcode = TRUE;
+	if (before_id != NULL && *before_id) {
+		guint64 before_steamid;
+
+		if (!steam_ipc_message(conv_name, before_id, &before_steamid,
+		                       &fetch->before_timestamp, &fetch->before_ordinal)) {
+			steam_older_fetch_free(fetch);
+			return FALSE;
+		}
+		fetch->has_before = TRUE;
+		query.time_last = fetch->before_timestamp;
+		query.ordinal_last = fetch->before_ordinal;
+		// One more, in case Steam counts the before message itself
+		query.count = MIN(fetch->count + 1, STEAM_OLDER_MAX);
+	} else {
+		query.time_last = G_MAXINT32;
+		query.count = fetch->count;
+	}
+
+	sa->older_fetches = g_slist_prepend(sa->older_fetches, fetch);
+	steam_cm_get_recent_messages_query(sa->cm, friend_steamid, &query, steam_got_older_cb, fetch);
+	return TRUE;
+}
+
 static void
 steam_ipc_register(PurplePlugin *plugin)
 {
@@ -3410,7 +3585,28 @@ steam_ipc_register(PurplePlugin *plugin)
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_STRING));
 
-	purple_debug_info("steam", "UI has message-meta: registered IPC command send-marker\n");
+	purple_plugin_ipc_register(plugin, "mam-fetch-older",
+			PURPLE_CALLBACK(steam_ipc_mam_fetch_older),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_UINT,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_UINT));
+
+	/* (account, conv name, first id, last id, complete) */
+	purple_signal_register(plugin, "mam-query-done",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER_UINT,
+			NULL, 5,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_BOOLEAN));
+	steam_signals_registered = TRUE;
+
+	purple_debug_info("steam", "UI has message-meta: registered IPC commands send-marker and "
+	                  "mam-fetch-older, and the signal mam-query-done\n");
 }
 
 /******************************************************************************/
@@ -3474,6 +3670,7 @@ static gboolean plugin_load(PurplePlugin *plugin)
 
 #endif
 
+	steam_plugin = plugin;
 	steam_ipc_register(plugin);
 
 	return TRUE;
@@ -3481,6 +3678,12 @@ static gboolean plugin_load(PurplePlugin *plugin)
 
 static gboolean plugin_unload(PurplePlugin *plugin)
 {
+	// libpurple drops the IPC commands itself
+	if (steam_signals_registered) {
+		purple_signal_unregister(plugin, "mam-query-done");
+		steam_signals_registered = FALSE;
+	}
+
 #ifdef G_OS_UNIX
 
 #ifdef USE_GNOME_KEYRING

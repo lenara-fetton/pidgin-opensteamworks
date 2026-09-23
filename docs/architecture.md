@@ -305,6 +305,21 @@ nothing new runs, and the output is exactly what it was.
   <our username>)`. Steam doesn't tell us when the friend reads our
   messages.
 
+- **Scroll-back.** IPC `mam-fetch-older(account, conv name, before id,
+  guint count)` (1-100) sends `FriendMessages.GetRecentMessages#1` with
+  `time_last`/`ordinal_last` = the before message's timestamp and ordinal
+  (no before id: `time_last` = 2^31-1, the newest page), `bbcode_format`,
+  and `count` + 1 in case Steam counts the before message itself; the
+  plugin drops anything not older than it and keeps the newest `count`.
+  The page is written oldest first with `PURPLE_MESSAGE_DELAYED` and `mam`
+  = `1`, `mam-query` = `older`, then the plugin's signal
+  `mam-query-done(account, conv name, first id, last id, guint complete)`
+  (registered on the prpl, message-meta UIs only) gives the oldest id (the
+  next page's before id), the newest, and whether `more_available` was
+  false. A failed request emits nothing. The sign-on catch-up
+  (`GetActiveMessageSessions` + `GetRecentMessages` since the last message
+  seen) is unchanged apart from `mam-query` = `catchup` and BBCode.
+
 ## Testing without a Steam account
 
 - `tests/test_proto.c`: round-trips for `steam_proto` and `steam_msgs`;
