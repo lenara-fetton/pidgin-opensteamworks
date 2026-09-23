@@ -160,6 +160,7 @@ struct _SteamAccount {
 	GSList *older_fetches;         /* SteamOlderFetch: scroll-back pages in flight */
 	GHashTable *own_reactions;     /* message id -> GHashTable set of our reactions (display form) */
 	GSList *reaction_updates;      /* SteamReactionUpdate: UpdateMessageReaction in flight */
+	GHashTable *app_images;        /* appid -> game image URL from the store API (native_meta) */
 };
 
 struct _SteamBuddy {

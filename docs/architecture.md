@@ -342,6 +342,18 @@ nothing new runs, and the output is exactly what it was.
   It returns FALSE, sending nothing, if an entry isn't a Steam reaction
   (e.g. a Unicode emoji).
 
+- **Game image.** The `ingame` status type has a third attribute,
+  `game_icon_url`, set (next to `game` and `game_app_id`) only for
+  message-meta UIs: an https image of the game on Steam's CDN, taken from
+  the store API reply the plugin already fetches for game names
+  (`appdetails?appids=N&filters=basic`: `capsule_imagev5`, the 184×69
+  capsule, else `capsule_image`), cached per app id for the session. With
+  a message-meta UI the lookup also runs when the CM supplied the name. The
+  square community icon
+  (`cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/<appid>/<hash>.jpg`)
+  needs the app's icon hash, which neither `CMsgClientPersonaState` nor
+  appdetails carries (it is in the PICS app info), so it isn't used.
+
 ## Testing without a Steam account
 
 - `tests/test_proto.c`: round-trips for `steam_proto` and `steam_msgs`;

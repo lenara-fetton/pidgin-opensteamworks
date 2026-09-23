@@ -887,6 +887,7 @@ steam_native_init(SteamAccount *sa)
 		return;
 	sa->own_reactions = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
 	                                          (GDestroyNotify) g_hash_table_destroy);
+	sa->app_images = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
 	purple_debug_info("steam", "UI supports message-meta: inline images and emoticons, "
 	                  "message ids, read markers, scroll-back, reactions\n");
 }
@@ -1527,12 +1528,57 @@ typedef struct {
 	PurpleUtilFetchUrlData *url_data;
 } SteamAppFetch;
 
+/* Hosts of Steam's CDN for store and community images */
+static const gchar *const steam_app_image_hosts[] = {
+	"shared.akamai.steamstatic.com",
+	"shared.cloudflare.steamstatic.com",
+	"shared.fastly.steamstatic.com",
+	"cdn.cloudflare.steamstatic.com",
+	"cdn.akamai.steamstatic.com",
+	"cdn.fastly.steamstatic.com",
+	"steamcdn-a.akamaihd.net",
+};
+
+/* An https URL on Steam's CDN, or NULL (caller frees) */
+static gchar *
+steam_app_image_url(const gchar *url)
+{
+	gboolean https = FALSE;
+	gchar *host = url ? steam_rich_url_host(url, &https) : NULL;
+	gchar *ret = NULL;
+	guint i;
+
+	if (host != NULL && https) {
+		for (i = 0; i < G_N_ELEMENTS(steam_app_image_hosts); i++) {
+			if (g_str_equal(host, steam_app_image_hosts[i]) &&
+			    strpbrk(url, " \"'<>\\") == NULL && g_utf8_validate(url, -1, NULL))
+				ret = g_strdup(url);
+		}
+	}
+	g_free(host);
+	return ret;
+}
+
+/* The game's image for message-meta UIs, from an appdetails "data" object:
+ * the store's small capsule (184x69), else the bigger one. The square
+ * community icon would need the app's icon hash, which neither the CM
+ * persona data nor appdetails carries. */
+static gchar *
+steam_app_image_from_details(JsonObject *data)
+{
+	gchar *url = steam_app_image_url(json_object_get_string_member(data, "capsule_imagev5"));
+
+	if (url == NULL)
+		url = steam_app_image_url(json_object_get_string_member(data, "capsule_image"));
+	return url;
+}
+
 static void
 steam_got_app_name_cb(PurpleUtilFetchUrlData *url_data, gpointer user_data, const gchar *url_text, gsize len, const gchar *error_message)
 {
 	SteamAppFetch *fetch = user_data;
 	SteamAccount *sa = fetch->sa;
-	gchar *name = NULL;
+	gchar *name = NULL, *image = NULL;
 	JsonParser *parser;
 	GSList *buddies, *l;
 
@@ -1555,19 +1601,25 @@ steam_got_app_name_cb(PurpleUtilFetchUrlData *url_data, gpointer user_data, cons
 
 				if (app_name && *app_name)
 					name = purple_utf8_salvage(app_name);
+				if (data && sa->native_meta)
+					image = steam_app_image_from_details(data);
 			}
 		}
 		g_object_unref(parser);
 	}
 
-	if (name == NULL)
+	if (image != NULL)
+		g_hash_table_replace(sa->app_images, GUINT_TO_POINTER(fetch->appid), g_strdup(image));
+
+	if (name == NULL && image == NULL)
 	{
 		purple_debug_info("steam", "no name found for app %u\n", fetch->appid);
 		g_free(fetch);
 		return;
 	}
 
-	g_hash_table_replace(sa->app_names, GUINT_TO_POINTER(fetch->appid), g_strdup(name));
+	if (name != NULL)
+		g_hash_table_replace(sa->app_names, GUINT_TO_POINTER(fetch->appid), g_strdup(name));
 
 	buddies = purple_find_buddies(sa->account, NULL);
 	for (l = buddies; l; l = l->next)
@@ -1575,14 +1627,20 @@ steam_got_app_name_cb(PurpleUtilFetchUrlData *url_data, gpointer user_data, cons
 		PurpleBuddy *buddy = l->data;
 		SteamBuddy *sbuddy = buddy->proto_data;
 
-		if (sbuddy && sbuddy->game_app_id == fetch->appid && !sbuddy->gameextrainfo)
+		if (sbuddy && sbuddy->game_app_id == fetch->appid && name && !sbuddy->gameextrainfo)
 		{
 			sbuddy->gameextrainfo = g_strdup(name);
+			steam_buddy_update_status(sa, sbuddy);
+		}
+		else if (sbuddy && sbuddy->game_app_id == fetch->appid && image && sbuddy->gameextrainfo)
+		{
+			// Now with the image
 			steam_buddy_update_status(sa, sbuddy);
 		}
 	}
 	g_slist_free(buddies);
 
+	g_free(image);
 	g_free(name);
 	g_free(fetch);
 }
@@ -2133,8 +2191,13 @@ steam_buddy_update_status(SteamAccount *sa, SteamBuddy *sbuddy)
 		/* Rich presence for UIs that show it (pidgin4): "game" is the name,
 		 * "game_app_id" the Steam app id (unset for non-Steam games) */
 		gchar *app_id = sbuddy->game_app_id ? g_strdup_printf("%u", sbuddy->game_app_id) : NULL;
+		const gchar *image = (sa->native_meta && sbuddy->game_app_id)
+			? g_hash_table_lookup(sa->app_images, GUINT_TO_POINTER(sbuddy->game_app_id)) : NULL;
 
-		if (app_id)
+		if (app_id && image)
+			purple_prpl_got_user_status(sa->account, steamid, "ingame", "game", sbuddy->gameextrainfo,
+			                            "game_app_id", app_id, "game_icon_url", image, NULL);
+		else if (app_id)
 			purple_prpl_got_user_status(sa->account, steamid, "ingame", "game", sbuddy->gameextrainfo,
 			                            "game_app_id", app_id, NULL);
 		else
@@ -2164,6 +2227,9 @@ steam_buddy_set_game(SteamAccount *sa, SteamBuddy *sbuddy, const SteamCMPersona 
 
 	if (persona->game_name && *persona->game_name) {
 		sbuddy->gameextrainfo = purple_utf8_salvage(persona->game_name);
+		// message-meta UIs also get the game's image from the same lookup
+		if (sa->native_meta)
+			steam_get_app_name(sa, persona->game_app_id);
 	} else {
 		sbuddy->gameextrainfo = g_strdup(steam_get_app_name(sa, persona->game_app_id));
 	}
@@ -3032,6 +3098,8 @@ static void steam_close(PurpleConnection *pc)
 	}
 	if (sa->own_reactions != NULL)
 		g_hash_table_destroy(sa->own_reactions);
+	if (sa->app_images != NULL)
+		g_hash_table_destroy(sa->app_images);
 
 	while (sa->older_fetches != NULL) {
 		// steam_cm_free() dropped their callbacks
@@ -3218,12 +3286,15 @@ steam_status_types(PurpleAccount *account)
 
 	// Independent, unsettable status for being in-game.
 	// "game" is the game's name, "game_app_id" its Steam app id (a decimal
-	// string; unset for non-Steam games). UIs that don't know the attributes
+	// string; unset for non-Steam games) and, for message-meta UIs only,
+	// "game_icon_url" an https image of the game from Steam's CDN (the
+	// store's small capsule, 184x69). UIs that don't know the attributes
 	// ignore them.
 	status = purple_status_type_new_with_attrs(PURPLE_STATUS_TUNE,
 			"ingame", NULL, FALSE, FALSE, TRUE,
 			"game", "Game Title", purple_value_new(PURPLE_TYPE_STRING),
 			"game_app_id", "Game App ID", purple_value_new(PURPLE_TYPE_STRING),
+			"game_icon_url", "Game Icon URL", purple_value_new(PURPLE_TYPE_STRING),
 			NULL);
 	types = g_list_append(types, status);
 

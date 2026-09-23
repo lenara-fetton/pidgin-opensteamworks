@@ -51,11 +51,12 @@ int main(int argc, char **argv)
 				ingame = t->data;
 		if (!ingame || purple_status_type_is_exclusive(ingame) ||
 		    !purple_status_type_get_attr(ingame, "game") ||
-		    !purple_status_type_get_attr(ingame, "game_app_id")) {
-			printf("FAIL: no ingame status type with game and game_app_id attributes\n");
+		    !purple_status_type_get_attr(ingame, "game_app_id") ||
+		    !purple_status_type_get_attr(ingame, "game_icon_url")) {
+			printf("FAIL: no ingame status type with game, game_app_id and game_icon_url attributes\n");
 			fails++;
 		} else {
-			printf("ingame attributes: game, game_app_id\n");
+			printf("ingame attributes: game, game_app_id, game_icon_url\n");
 		}
 	}
 	for (l = prpl->protocol_options; l; l = l->next)
