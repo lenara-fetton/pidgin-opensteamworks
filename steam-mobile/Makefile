@@ -30,7 +30,12 @@ else ifeq ($(STEAM_CRYPT_BACKEND), openssl)
 endif
 
 STEAM_SOURCES = \
+	steam_proto.c \
+	steam_msgs.c \
+	steam_ws.c \
 	steam_connection.c \
+	steam_auth.c \
+	steam_cm.c \
 	libsteam.c
 
 STEAM_OBJS = $(patsubst %.c, %.o, $(STEAM_SOURCES))
